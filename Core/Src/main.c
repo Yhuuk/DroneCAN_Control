@@ -27,6 +27,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "lcd_draw.h"
 
 /* USER CODE END Includes */
 
@@ -98,6 +99,11 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  /* LCD 使用 SPI1 阻塞发送；GPIO 与 SPI 初始化完成后再初始化屏幕。 */
+  LCD_Init();
+  LCD_Fill(0U, 0U, LCD_W, LCD_H, BLACK);
+  LCD_ShowString(4U, 4U, "LCD OK", GREEN, BLACK, 16U);
+  LCD_ShowChinese(4U, 24U, "显示", YELLOW, BLACK, 16U);
 
   /* USER CODE END 2 */
 
