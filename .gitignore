@@ -1,0 +1,16 @@
+# vscode配置
+.vscode/
+
+# CubeMX workspace metadata
+.mxproject
+
+# Windows metadata
+Thumbs.db
+Desktop.ini
+
+# build 编译中间文件.前面的斜杠代表忽略根目录下的build文件夹，后面的斜杠代表忽略文件夹
+/build/
+/debug.log
+
+# 调试文件
+EventRecorderStub.scvd
