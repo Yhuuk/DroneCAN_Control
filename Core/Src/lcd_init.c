@@ -5,13 +5,13 @@
 #define LCD_SPI_TIMEOUT_MS 100U
 
 /**
- * @brief 通过 SPI1 阻塞发送一段字节流。
- * @note  CS 在一整段数据发送期间保持低电平；HAL 返回错误时进入工程统一错误处理。
+ * @brief 通过 SPI1 阻塞发送一个字节。
+ * @note  严格复刻原示例时序：每发送一个字节，CS 都产生一次完整的低脉冲。
  */
-static void LCD_SPI_Write(const uint8_t *data, uint16_t size)
+static void LCD_SPI_WriteByte(uint8_t data)
 {
     HAL_GPIO_WritePin(OLED_CS_GPIO_Port, OLED_CS_Pin, GPIO_PIN_RESET);
-    if (HAL_SPI_Transmit(&hspi1, (uint8_t *)data, size, LCD_SPI_TIMEOUT_MS) != HAL_OK)
+    if (HAL_SPI_Transmit(&hspi1, &data, 1U, LCD_SPI_TIMEOUT_MS) != HAL_OK)
     {
         HAL_GPIO_WritePin(OLED_CS_GPIO_Port, OLED_CS_Pin, GPIO_PIN_SET);
         Error_Handler();
@@ -23,52 +23,38 @@ static void LCD_SPI_Write(const uint8_t *data, uint16_t size)
 void LCD_WR_REG(uint8_t reg)
 {
     HAL_GPIO_WritePin(OLED_DC_GPIO_Port, OLED_DC_Pin, GPIO_PIN_RESET);
-    LCD_SPI_Write(&reg, 1U);
+    LCD_SPI_WriteByte(reg);
+
+    /* 原示例在命令字节结束后将 DC 恢复为数据电平。 */
+    HAL_GPIO_WritePin(OLED_DC_GPIO_Port, OLED_DC_Pin, GPIO_PIN_SET);
 }
 
 /** @brief 向屏幕写一个 8 位参数（DC=1）。 */
 void LCD_WR_DATA8(uint8_t data)
 {
     HAL_GPIO_WritePin(OLED_DC_GPIO_Port, OLED_DC_Pin, GPIO_PIN_SET);
-    LCD_SPI_Write(&data, 1U);
+    LCD_SPI_WriteByte(data);
 }
 
 /** @brief 向屏幕写一个 RGB565 像素，高字节先发送。 */
 void LCD_WR_DATA(uint16_t data)
 {
-    uint8_t bytes[2] = {(uint8_t)(data >> 8), (uint8_t)data};
-
     HAL_GPIO_WritePin(OLED_DC_GPIO_Port, OLED_DC_Pin, GPIO_PIN_SET);
-    LCD_SPI_Write(bytes, sizeof(bytes));
+    LCD_SPI_WriteByte((uint8_t)(data >> 8));
+    LCD_SPI_WriteByte((uint8_t)data);
 }
 
-/** @brief 连续写入相同颜色，供区域填充使用，减少 HAL 调用次数。 */
+/**
+ * @brief 连续写入相同颜色，供区域填充使用。
+ * @note  诊断阶段保留原示例逐像素、逐字节的 CS 时序，不做批量发送优化。
+ */
 static void LCD_WriteColorRepeat(uint16_t color, uint32_t count)
 {
-    uint8_t buffer[64];
-    uint16_t i;
-
-    for (i = 0U; i < sizeof(buffer); i += 2U)
-    {
-        buffer[i] = (uint8_t)(color >> 8);
-        buffer[i + 1U] = (uint8_t)color;
-    }
-
-    HAL_GPIO_WritePin(OLED_DC_GPIO_Port, OLED_DC_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(OLED_CS_GPIO_Port, OLED_CS_Pin, GPIO_PIN_RESET);
     while (count > 0U)
     {
-        uint16_t pixels = (count > (sizeof(buffer) / 2U)) ?
-                          (uint16_t)(sizeof(buffer) / 2U) : (uint16_t)count;
-        if (HAL_SPI_Transmit(&hspi1, buffer, (uint16_t)(pixels * 2U),
-                             LCD_SPI_TIMEOUT_MS) != HAL_OK)
-        {
-            HAL_GPIO_WritePin(OLED_CS_GPIO_Port, OLED_CS_Pin, GPIO_PIN_SET);
-            Error_Handler();
-        }
-        count -= pixels;
+        LCD_WR_DATA(color);
+        --count;
     }
-    HAL_GPIO_WritePin(OLED_CS_GPIO_Port, OLED_CS_Pin, GPIO_PIN_SET);
 }
 
 

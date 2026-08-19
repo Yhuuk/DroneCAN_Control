@@ -40,6 +40,12 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+/*
+ * 1：只运行 SPI1 波形诊断，不初始化屏幕，也不启动 FreeRTOS。
+ * 0：恢复正常的 LCD 和 FreeRTOS 启动流程。
+ */
+#define SPI_WAVEFORM_TEST_MODE 0U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -101,15 +107,69 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  /* LCD 使用 SPI1 阻塞发送；GPIO 与 SPI 初始化完成后再初始化屏幕。 */
+#if SPI_WAVEFORM_TEST_MODE
+  /*
+   * SPI1 独立波形测试：
+   * - OLED 保持复位，避免测试数据被识别为显示指令；
+   * - CS 拉低期间连续发送 32 字节 0xAA；
+   * - 每次发送后将 CS 拉高 10 ms，形成容易触发的重复数据包；
+   * - CAN LED 周期翻转，表示程序仍在正常执行测试循环。
+   */
+  uint8_t spi_test_pattern[32];
+  uint32_t spi_test_count = 0U;
+
+  for (uint32_t i = 0U; i < sizeof(spi_test_pattern); ++i)
+  {
+    spi_test_pattern[i] = 0xAAU;
+  }
+
+  HAL_GPIO_WritePin(OLED_RST_GPIO_Port, OLED_RST_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(OLED_DC_GPIO_Port, OLED_DC_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(OLED_CS_GPIO_Port, OLED_CS_Pin, GPIO_PIN_SET);
+
+  while (1)
+  {
+    HAL_GPIO_WritePin(OLED_CS_GPIO_Port, OLED_CS_Pin, GPIO_PIN_RESET);
+    if (HAL_SPI_Transmit(&hspi1, spi_test_pattern,
+                         (uint16_t)sizeof(spi_test_pattern), 100U) != HAL_OK)
+    {
+      HAL_GPIO_WritePin(OLED_CS_GPIO_Port, OLED_CS_Pin, GPIO_PIN_SET);
+      Error_Handler();
+    }
+    HAL_GPIO_WritePin(OLED_CS_GPIO_Port, OLED_CS_Pin, GPIO_PIN_SET);
+
+    ++spi_test_count;
+    if (spi_test_count >= 25U)
+    {
+      HAL_GPIO_TogglePin(CAN_LED_GPIO_Port, CAN_LED_Pin);
+      spi_test_count = 0U;
+    }
+
+    HAL_Delay(10U);
+  }
+#else
+
   LCD_Init();
-  LCD_Fill(0U, 0U, LCD_W, LCD_H, BLACK);
-  LCD_ShowString(4U, 4U, "LCD OK", GREEN, BLACK, 16U);
-  LCD_ShowChinese(4U, 24U, "显示", YELLOW, BLACK, 16U);
+  LCD_Fill(0U, 0U, LCD_W, LCD_H, WHITE);
+
+  /*
+   * 字库与显存写入综合测试：
+   * - 中文使用字库中已确认存在的 16x16 UTF-8 字模；
+   * - 英文、数字和符号使用 8x16/12x24 ASCII 字模；
+   * - 所有字符串宽度均不超过屏幕的 120 像素。
+   */
+  LCD_ShowChinese(4U, 8U, "显示测试", RED, WHITE, 16U);
+  LCD_ShowString(4U, 32U, "LCD OK!", BLUE, WHITE, 24U);
+  LCD_ShowString(4U, 62U, "0123456789", BLACK, WHITE, 16U);
+  LCD_ShowString(4U, 84U, "!@#$%^&*()", MAGENTA, WHITE, 16U);
+  LCD_ShowString(4U, 106U, "+-*/=<>[]{}", GREEN, WHITE, 16U);
+  LCD_ShowChinese(4U, 132U, "欢迎您", DARKBLUE, WHITE, 16U);
+  LCD_ShowChinese(4U, 156U, "亮度测试", BROWN, WHITE, 16U);
 
   HAL_GPIO_WritePin(Throttle_LED_GPIO_Port, Throttle_LED_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(Direction_LED_GPIO_Port, Direction_LED_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(CAN_LED_GPIO_Port, CAN_LED_Pin, GPIO_PIN_RESET);
+#endif
 
   /* USER CODE END 2 */
 
