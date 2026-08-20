@@ -150,7 +150,7 @@ int main(void)
 #else
 
   LCD_Init();
-  LCD_Fill(0U, 0U, LCD_W, LCD_H, WHITE);
+  LCD_Fill(0U, 0U, LCD_W, LCD_H, BLACK);
 
   /*
    * 字库与显存写入综合测试：

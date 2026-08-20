@@ -47,12 +47,22 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/lcd_init.c
     Core/Src/lcd_draw.c
+
+    # libcanard 传输层
+    third_party/libcanard/canard.c
+
+    # DroneCAN DSDL生成代码
+    third_party/dronecan_custom_dsdl/dronecan_dsdl_generated/src/dronecan_dshot.DirectionCommand.c
+    third_party/dronecan_custom_dsdl/dronecan_dsdl_generated/src/uavcan.equipment.esc.RawCommand.c
+  
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     Core/Inc
+    third_party/dronecan_custom_dsdl/dronecan_dsdl_generated/include
+    third_party/libcanard
 )
 
 # Add project symbols (macros)

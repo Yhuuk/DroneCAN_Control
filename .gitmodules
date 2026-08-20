@@ -1,0 +1,6 @@
+[submodule "third_party/dronecan_custom_dsdl"]
+	path = third_party/dronecan_custom_dsdl
+	url = git@github.com:Yhuuk/DroneCAN_Custom_DSDL.git
+[submodule "third_party/libcanard"]
+	path = third_party/libcanard
+	url = git@github.com:dronecan/libcanard.git
