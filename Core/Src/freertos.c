@@ -25,6 +25,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "can_port.h"
+#include "dronecan_node.h"
 
 /* USER CODE END Includes */
 
@@ -52,6 +54,20 @@ osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
   .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for CanTask */
+osThreadId_t CanTaskHandle;
+const osThreadAttr_t CanTask_attributes = {
+  .name = "CanTask",
+  .stack_size = 384 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
+/* Definitions for InputTask */
+osThreadId_t InputTaskHandle;
+const osThreadAttr_t InputTask_attributes = {
+  .name = "InputTask",
+  .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
@@ -61,6 +77,8 @@ const osThreadAttr_t defaultTask_attributes = {
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
+void StartCanTask(void *argument);
+void StartInputTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -123,6 +141,12 @@ void MX_FREERTOS_Init(void) {
   /* creation of defaultTask */
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
+  /* creation of CanTask */
+  CanTaskHandle = osThreadNew(StartCanTask, NULL, &CanTask_attributes);
+
+  /* creation of InputTask */
+  InputTaskHandle = osThreadNew(StartInputTask, NULL, &InputTask_attributes);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
@@ -149,6 +173,73 @@ void StartDefaultTask(void *argument)
     osDelay(1);
   }
   /* USER CODE END StartDefaultTask */
+}
+
+/* USER CODE BEGIN Header_StartCanTask */
+/**
+* @brief Function implementing the CanTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartCanTask */
+void StartCanTask(void *argument)
+{
+  /* USER CODE BEGIN StartCanTask */
+  HAL_StatusTypeDef status = HAL_OK;
+
+  (void)argument;
+
+  status = CAN_Port_Init();
+
+  if(status != HAL_OK) {
+      // Handle error
+      Error_Handler();
+
+  }
+
+  DroneCAN_Node_Init();
+
+
+  /* Infinite loop */
+  for(;;)
+  {
+    status = DroneCAN_ProcessTx();
+    
+      if (status == HAL_BUSY)
+        {
+            /*
+             * CAN邮箱暂时没有空间，保留libcanard帧，
+             * 下一轮继续尝试。
+             */
+        }
+        else if (status != HAL_OK)
+        {
+            /*
+             * 记录错误，后续增加错误恢复。
+             */
+        }
+
+    osDelay(1);
+  }
+  /* USER CODE END StartCanTask */
+}
+
+/* USER CODE BEGIN Header_StartInputTask */
+/**
+* @brief Function implementing the InputTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartInputTask */
+void StartInputTask(void *argument)
+{
+  /* USER CODE BEGIN StartInputTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartInputTask */
 }
 
 /* Private application code --------------------------------------------------*/
