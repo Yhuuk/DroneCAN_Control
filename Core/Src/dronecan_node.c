@@ -74,6 +74,7 @@ int16_t DroneCAN_SetMotorDirection(
         canardInitTxTransfer(&transfer);
         
         transfer.transfer_type = CanardTransferTypeBroadcast;
+        transfer.data_type_signature = DRONECAN_DSHOT_DIRECTIONCOMMAND_SIGNATURE;
         transfer.data_type_id = DRONECAN_DSHOT_DIRECTIONCOMMAND_ID;
         transfer.inout_transfer_id = &g_direction_transfer_id;   //g_direction_transfer_id会在ibcanard成功入队后自动递增。
         transfer.priority = CANARD_TRANSFER_PRIORITY_MEDIUM;
@@ -112,4 +113,63 @@ int16_t DroneCAN_Motor1_SetNormal(void){
 
 int16_t DroneCAN_Motor1_SetReversed(void){
     return DroneCAN_SetMotorDirection(0x01, DRONECAN_DSHOT_DIRECTIONCOMMAND_OPERATION_SET_REVERSED);
+}
+
+
+HAL_StatusTypeDef DroneCAN_ProcessTx(void){
+
+    CanardCANFrame *tx_frame;
+
+    HAL_StatusTypeDef status;
+
+    //canardPeekTxQueue 是ibcanard的函数,它会返回发送队列中优先级最高的CAN帧,如果发送队列为空则返回NULL。
+    /**
+     * canardPeekTxQueue 
+     */
+    tx_frame = canardPeekTxQueue(&canard_instance);
+
+    /**
+     * 如果没有要发送的CAN帧,直接返回HAL_OK,表示没有错误,只是没有要发送的CAN帧。
+     */
+    if(tx_frame == NULL){
+
+        return HAL_OK;    //没有要发送的CAN帧,直接返回
+
+    }
+
+    if((tx_frame->id & CANARD_CAN_FRAME_EFF) == 0U){
+        /**
+         * DroneCAN 帧必须是29位扩展帧,而不是11位标准帧,所以如果tx_frame->id的最高位没有设置,说明这个CAN帧不是扩展帧,libcanard不支持发送标准帧。
+         */
+        return HAL_ERROR; 
+
+    }
+
+    if((tx_frame->id & CANARD_CAN_FRAME_RTR) != 0U){
+        /**
+         * DroneCAN 帧必须是数据帧,而不是远程帧,所以如果tx_frame->id的第二高位设置了,说明这个CAN帧是远程帧,libcanard不支持发送远程帧。
+         */
+        return HAL_ERROR; 
+
+    }
+
+    //CAN_Port_SendExtendedMessage 中调用了 HAL_CAN_AddTxMessage() 发送CAN帧,如果发送成功则返回HAL_OK,否则返回HAL_ERROR或HAL_BUSY。
+    status = CAN_Port_SendExtendedMessage(tx_frame->id & CANARD_CAN_EXT_ID_MASK, tx_frame->data, tx_frame->data_len);
+
+    if(status == HAL_OK){
+
+        /**
+         * canardPopTxQueue 是ibcanard的函数,它会从发送队列中移除优先级最高的CAN帧,因为这个CAN帧已经成功发送出去,所以需要从发送队列中移除。
+         * 
+         * HAL_OK = 帧已经复制进CAN硬件发送邮箱
+         */
+        canardPopTxQueue(&canard_instance);  //发送成功,从发送队列中移除这个CAN帧。
+
+    }
+
+
+    return status;
+
+
+
 }

@@ -15,7 +15,7 @@ HAL_StatusTypeDef CAN_Port_Init(void) {
     filterConfig.FilterMaskIdHigh = 0x0000;
     filterConfig.FilterMaskIdLow = 0x0000;
     filterConfig.FilterFIFOAssignment = CAN_FilterFIFO0;
-    filterConfig.FilterActivation = ENABLE;   //激活
+    filterConfig.FilterActivation = CAN_FILTER_ENABLE;   //激活
     filterConfig.SlaveStartFilterBank = 14;
 
     status = HAL_CAN_ConfigFilter(&hcan1, &filterConfig);
@@ -35,7 +35,7 @@ HAL_StatusTypeDef CAN_Port_Init(void) {
     return HAL_OK;
 }
 
-HAL_StatusTypeDef CAN_Port_SendExtendedMessage(uint32_t extended_id, uint8_t *data, uint8_t data_length) {
+HAL_StatusTypeDef CAN_Port_SendExtendedMessage(uint32_t extended_id, uint8_t const *data, uint8_t data_length) {
     CAN_TxHeaderTypeDef tx_header = {0};
     uint32_t tx_mailbox;
 
