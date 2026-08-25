@@ -50,6 +50,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/can_port.c
     Core/Src/dronecan_node.c
     Core/Src/key_input.c
+    Core/Src/motor_direction_ui.c
 
     # libcanard 传输层
     third_party/libcanard/canard.c

@@ -28,7 +28,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "lcd_draw.h"
+#include "lcd_init.h"
+#include "motor_direction_ui.h"
 
 /* USER CODE END Includes */
 
@@ -150,21 +151,15 @@ int main(void)
 #else
 
   LCD_Init();
-  LCD_Fill(0U, 0U, LCD_W, LCD_H, BLACK);
 
   /*
-   * 字库与显存写入综合测试：
-   * - 中文使用字库中已确认存在的 16x16 UTF-8 字模；
-   * - 英文、数字和符号使用 8x16/12x24 ASCII 字模；
-   * - 所有字符串宽度均不超过屏幕的 120 像素。
+   * 启动阶段先显示电机方向页面的静态效果：
+   * - 默认输出状态为OFF；
+   * - 默认选中1号电机；
+   * - 此处仅绘制界面，不会发送任何电机方向或油门命令。
+   * 后续接入UI状态机后，再由显示任务根据实际状态刷新局部内容。
    */
-  LCD_ShowChinese(4U, 8U, "显示测试", RED, WHITE, 16U);
-  LCD_ShowString(4U, 32U, "LCD OK!", BLUE, WHITE, 24U);
-  LCD_ShowString(4U, 62U, "0123456789", BLACK, WHITE, 16U);
-  LCD_ShowString(4U, 84U, "!@#$%^&*()", MAGENTA, WHITE, 16U);
-  LCD_ShowString(4U, 106U, "+-*/=<>[]{}", GREEN, WHITE, 16U);
-  LCD_ShowChinese(4U, 132U, "欢迎您", DARKBLUE, WHITE, 16U);
-  LCD_ShowChinese(4U, 156U, "亮度测试", BROWN, WHITE, 16U);
+  MotorDirectionUI_Draw(MOTOR_DIRECTION_UI_POWER_OFF, 1U);
 
   HAL_GPIO_WritePin(Throttle_LED_GPIO_Port, Throttle_LED_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(Direction_LED_GPIO_Port, Direction_LED_Pin, GPIO_PIN_RESET);
