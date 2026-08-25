@@ -107,12 +107,23 @@ int16_t DroneCAN_SetMotorDirection(
 
 
 int16_t DroneCAN_Motor1_SetNormal(void){
-    
-    return DroneCAN_SetMotorDirection(0x01, DRONECAN_DSHOT_DIRECTIONCOMMAND_OPERATION_SET_NORMAL);
+    return DroneCAN_SetMotorsNormal(0x01U);
 }
 
 int16_t DroneCAN_Motor1_SetReversed(void){
-    return DroneCAN_SetMotorDirection(0x01, DRONECAN_DSHOT_DIRECTIONCOMMAND_OPERATION_SET_REVERSED);
+    return DroneCAN_SetMotorsReversed(0x01U);
+}
+
+int16_t DroneCAN_SetMotorsNormal(uint8_t motor_mask){
+    return DroneCAN_SetMotorDirection(
+        motor_mask,
+        DRONECAN_DSHOT_DIRECTIONCOMMAND_OPERATION_SET_NORMAL);
+}
+
+int16_t DroneCAN_SetMotorsReversed(uint8_t motor_mask){
+    return DroneCAN_SetMotorDirection(
+        motor_mask,
+        DRONECAN_DSHOT_DIRECTIONCOMMAND_OPERATION_SET_REVERSED);
 }
 
 

@@ -25,8 +25,12 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "app_messages.h"
 #include "can_port.h"
 #include "dronecan_node.h"
+#include "key_input.h"
+
+#include <stdbool.h>
 
 /* USER CODE END Includes */
 
@@ -38,6 +42,15 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+/** InputTask每10个RTOS Tick扫描一次按键；当前1 Tick等于1 ms。 */
+#define INPUT_KEY_SCAN_PERIOD_TICKS 10U
+
+/**
+ * 方向命令是低频用户操作，长度8足以吸收短时间内的按键事件，同时又不会
+ * 允许大量过期方向命令在队列中堆积。
+ */
+#define CAN_COMMAND_QUEUE_LENGTH 8U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,6 +60,23 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
+
+/**
+ * InputTask是该队列的生产者，CanTask是消费者。队列复制CanCommand_t的
+ * 内容，在两个任务之间传递“设置哪些电机、设置成什么方向”的参数。
+ */
+osMessageQueueId_t CanCommandQueueHandle;
+
+/* 以下变量只用于调试器观察运行情况，不参与控制逻辑。 */
+volatile uint32_t g_key_press_count[KEY_ID_COUNT];
+volatile uint32_t g_input_command_queued_count;
+volatile uint32_t g_input_queue_full_count;
+volatile uint32_t g_input_direction_conflict_count;
+volatile uint32_t g_can_command_accepted_count;
+volatile uint32_t g_can_command_rejected_count;
+volatile uint32_t g_can_tx_busy_count;
+volatile uint32_t g_can_tx_error_count;
+volatile int16_t g_last_direction_enqueue_result;
 
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
@@ -73,6 +103,9 @@ const osThreadAttr_t InputTask_attributes = {
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
+
+static void InputTask_PostDirectionCommand(MotorDirection_t direction);
+static void CanTask_HandleCommand(const CanCommand_t *command);
 
 /* USER CODE END FunctionPrototypes */
 
@@ -134,7 +167,25 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
+  /*
+   * 创建InputTask到CanTask的单向命令队列。
+   * - message_count：最多保存8条尚未处理的命令；
+   * - message_size ：每条消息是一个完整的CanCommand_t结构体；
+   * - attr         ：NULL表示使用默认动态分配属性。
+   */
+  CanCommandQueueHandle = osMessageQueueNew(
+      CAN_COMMAND_QUEUE_LENGTH,
+      sizeof(CanCommand_t),
+      NULL);
+
+  if (CanCommandQueueHandle == NULL)
+  {
+    /*
+     * 队列创建失败通常意味着FreeRTOS堆空间不足。没有命令队列就不能
+     * 安全地把按键命令交给CanTask，因此当前调试阶段直接进入错误处理。
+     */
+    Error_Handler();
+  }
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -186,6 +237,7 @@ void StartCanTask(void *argument)
 {
   /* USER CODE BEGIN StartCanTask */
   HAL_StatusTypeDef status = HAL_OK;
+  CanCommand_t command;
 
   (void)argument;
 
@@ -203,6 +255,18 @@ void StartCanTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
+    /*
+     * 使用0超时非阻塞读取：队列为空时CanTask仍需继续处理libcanard的
+     * 发送队列，不能因为等待新按键命令而停止向CAN硬件邮箱搬运帧。
+     */
+    if (osMessageQueueGet(CanCommandQueueHandle,    // 从哪个队列取
+                          &command,                // 复制到哪个变量
+                          NULL,                    // 不需要读取消息优先级
+                          0U) == osOK)              // 队列为空时不等待
+    {
+      CanTask_HandleCommand(&command);
+    }
+
     status = DroneCAN_ProcessTx();
     
       if (status == HAL_BUSY)
@@ -211,12 +275,14 @@ void StartCanTask(void *argument)
              * CAN邮箱暂时没有空间，保留libcanard帧，
              * 下一轮继续尝试。
              */
+            g_can_tx_busy_count++;
         }
         else if (status != HAL_OK)
         {
             /*
              * 记录错误，后续增加错误恢复。
              */
+            g_can_tx_error_count++;
         }
 
     osDelay(1);
@@ -234,16 +300,176 @@ void StartCanTask(void *argument)
 void StartInputTask(void *argument)
 {
   /* USER CODE BEGIN StartInputTask */
+  KeyEvent_t key_events[KEY_ID_COUNT];
+  uint32_t next_wake_tick;
+
+  (void)argument;
+
+  /*
+   * 初始化全部5个按键。上电时已经被按住的按键不会立即产生事件，
+   * 必须先稳定释放、再重新按下，从而避免启动阶段误发方向命令。
+   */
+  KeyInput_Init();
+  next_wake_tick = osKernelGetTickCount();
+
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+    bool up_pressed = false;
+    bool down_pressed = false;
+    const uint8_t event_count = KeyInput_Scan(
+        key_events,
+        (uint8_t)KEY_ID_COUNT);
+
+    /*
+     * KeyInput_Scan会同时维护5个按键。当前阶段只有UP和DOWN映射为电机
+     * 方向命令；Confirm、Back、Switch的稳定按下事件只累计调试计数，
+     * 后续加入OLED菜单时可直接复用，无需重写GPIO消抖层。
+     */
+    for (uint8_t index = 0U; index < event_count; ++index)
+    {
+      const KeyEvent_t *const event = &key_events[index];
+
+      if (event->event_type != KEY_EVENT_PRESSED)
+      {
+        /* 当前业务只关心稳定按下；释放事件仍由状态机生成供以后使用。 */
+        continue;
+      }
+
+      if ((uint32_t)event->key_id < (uint32_t)KEY_ID_COUNT)
+      {
+        g_key_press_count[event->key_id]++;
+      }
+
+      if (event->key_id == KEY_ID_UP)
+      {
+        up_pressed = true;
+      }
+      else if (event->key_id == KEY_ID_DOWN)
+      {
+        down_pressed = true;
+      }
+      else
+      {
+        /* Confirm、Back、Switch暂不执行方向控制。 */
+      }
+    }
+
+    if (up_pressed && down_pressed)
+    {
+      /*
+       * 同一扫描周期内同时确认UP和DOWN会产生互相矛盾的Normal/Reversed
+       * 请求。为避免执行顺序决定最终方向，本次两个请求全部忽略。
+       */
+      g_input_direction_conflict_count++;
+    }
+    else if (up_pressed)
+    {
+      /* UP稳定按下一次：请求将1号电机明确设置为Normal。 */
+      InputTask_PostDirectionCommand(MOTOR_DIRECTION_NORMAL);
+    }
+    else if (down_pressed)
+    {
+      /* DOWN稳定按下一次：请求将1号电机明确设置为Reversed。 */
+      InputTask_PostDirectionCommand(MOTOR_DIRECTION_REVERSED);
+    }
+    else
+    {
+      /* 本周期没有新的方向按下事件。 */
+    }
+
+    /*
+     * 使用绝对周期延时，避免状态机执行时间长期累积到扫描周期中。
+     * 当前FreeRTOS Tick为1 kHz，因此10 Tick对应10 ms。
+     */
+    next_wake_tick += INPUT_KEY_SCAN_PERIOD_TICKS;
+    (void)osDelayUntil(next_wake_tick);
   }
   /* USER CODE END StartInputTask */
 }
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+/**
+ * @brief 将InputTask识别出的方向意图放入CanTask命令队列。
+ *
+ * 本函数不调用任何libcanard函数。发送到队列的是结构体副本，所以局部
+ * 变量command在函数返回后失效不会影响CanTask读取消息。
+ */
+static void InputTask_PostDirectionCommand(MotorDirection_t direction)
+{
+  const CanCommand_t command = {
+      .command_type = CAN_COMMAND_SET_DIRECTION,
+      .motor_mask = 0x01U, /* 当前阶段固定选择第1路电机。 */
+      .direction = direction
+  };
+
+  /*
+   * 方向按键是离散事件，不应阻塞InputTask等待队列空间。队列满时记录
+   * 错误并丢弃本次请求，避免旧命令积压后在用户未预期的时刻执行。
+   */
+  if (osMessageQueuePut(CanCommandQueueHandle,
+                        &command,
+                        0U,
+                        0U) == osOK)
+  {
+    g_input_command_queued_count++;
+  }
+  else
+  {
+    g_input_queue_full_count++;
+  }
+}
+
+/**
+ * @brief 在CanTask上下文中把应用命令转换为DroneCAN方向消息。
+ *
+ * 只有CanTask调用DroneCAN_SetMotorsNormal/Reversed，确保CanardInstance、
+ * Transfer-ID、request_id和libcanard发送队列始终只有一个任务访问，
+ * 因而不需要为libcanard再添加互斥锁。
+ */
+static void CanTask_HandleCommand(const CanCommand_t *command)
+{
+  int16_t result;
+
+  if ((command == NULL) ||
+      (command->command_type != CAN_COMMAND_SET_DIRECTION) ||
+      (command->motor_mask == 0U))
+  {
+    g_can_command_rejected_count++;
+    return;
+  }
+
+  if (command->direction == MOTOR_DIRECTION_NORMAL)
+  {
+    result = DroneCAN_SetMotorsNormal(command->motor_mask);
+  }
+  else if (command->direction == MOTOR_DIRECTION_REVERSED)
+  {
+    result = DroneCAN_SetMotorsReversed(command->motor_mask);
+  }
+  else
+  {
+    g_can_command_rejected_count++;
+    return;
+  }
+
+  /*
+   * DirectionCommand为7字节单帧消息，正常情况下result应为1，表示成功
+   * 加入一个libcanard软件队列帧；真正装入CAN邮箱由ProcessTx完成。
+   */
+  g_last_direction_enqueue_result = result;
+
+  if (result > 0)
+  {
+    g_can_command_accepted_count++;
+  }
+  else
+  {
+    g_can_command_rejected_count++;
+  }
+}
 
 /* USER CODE END Application */
 
