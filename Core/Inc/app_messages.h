@@ -12,8 +12,8 @@ typedef enum
 /**
  * @brief 应用层使用的电机目标方向。
  *
- * InputTask只表达Normal/Reversed语义，不接触DSDL结构体、Transfer-ID或
- * libcanard。CanTask收到该值后，再调用dronecan_node中的封装函数。
+ * UI/业务层只表达Normal/Reversed语义，不接触DSDL结构体、Transfer-ID
+ * 或libcanard。CanTask收到该值后，再调用dronecan_node中的封装函数。
  */
 typedef enum
 {
@@ -22,7 +22,7 @@ typedef enum
 } MotorDirection_t;
 
 /**
- * @brief InputTask通过FreeRTOS消息队列发送给CanTask的一条命令。
+ * @brief UI/业务层通过FreeRTOS消息队列发送给CanTask的一条命令。
  *
  * 消息队列会复制该结构体的全部内容，因此发送方可以使用局部变量，
  * 不需要在两个任务之间共享结构体地址。

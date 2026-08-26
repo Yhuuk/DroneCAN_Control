@@ -36,7 +36,14 @@
  */
 #define UI_COLOR_HEADER_BORDER       GRAYBLUE
 #define UI_COLOR_BODY_BORDER         GRAYBLUE
-#define UI_COLOR_FOCUS               YELLOW
+/*
+ * 三种焦点使用不同但不过度刺眼的颜色：暖黄提示总开关，柔白突出通道
+ * 数字，青绿突出方向三角形。颜色之外还用尺寸和位置编码，避免只依赖
+ * 色觉来分辨焦点层级。
+ */
+#define UI_COLOR_FOCUS_SWITCH        0xFDC0U
+#define UI_COLOR_FOCUS_MOTOR         WHITE
+#define UI_COLOR_FOCUS_DIRECTION     0x07F5U
 #define UI_COLOR_STATUS_BACKGROUND   LGRAY
 #define UI_COLOR_STATUS_OFF          RED
 #define UI_COLOR_STATUS_ON           GREEN
@@ -50,6 +57,20 @@
  * 字模，避免再次包含该数据定义头文件而产生重复符号。
  */
 extern const unsigned char ascii_1206[][12];
+
+/*
+ * 只缓存一条物理扫描行：120个RGB565像素共240字节。完整屏幕需要57,600
+ * 字节，超过本MCU可自由使用的RAM，因此不建立整屏帧缓冲区。
+ * MotorDirectionUI只由UiTask调用，所以该静态缓冲区不需要互斥锁。
+ */
+static uint8_t g_ui_physical_row_buffer[LCD_W * 2U];
+
+static const MotorDirectionUiView_t g_safe_default_view = {
+    .power_state = MOTOR_DIRECTION_UI_POWER_OFF,
+    .focus = MOTOR_DIRECTION_UI_FOCUS_SWITCH,
+    .selected_motor = 1U,
+    .selected_direction = MOTOR_DIRECTION_UI_NORMAL
+};
 
 #if (LCD_W != 120U) || (LCD_H != 240U)
 #error "MotorDirectionUI software rotation expects a 120x240 LCD framebuffer"
@@ -131,6 +152,29 @@ static bool MotorDirectionUI_PointInCapsule(uint16_t x,
                x, y, left + radius, center_y, radius) ||
            MotorDirectionUI_PointInCircle(
                x, y, right - radius, center_y, radius);
+}
+
+/** @brief 判断点是否位于1像素胶囊形边框上。 */
+static bool MotorDirectionUI_PointOnCapsuleBorder(uint16_t x,
+                                                  uint16_t y,
+                                                  uint16_t left,
+                                                  uint16_t top,
+                                                  uint16_t right,
+                                                  uint16_t bottom)
+{
+    if (!MotorDirectionUI_PointInCapsule(x, y, left, top, right, bottom))
+    {
+        return false;
+    }
+
+    /* 尺寸过小时不存在有效内层，此时整个胶囊都视为边框。 */
+    if (((right - left) < 3U) || ((bottom - top) < 3U))
+    {
+        return true;
+    }
+
+    return !MotorDirectionUI_PointInCapsule(
+        x, y, left + 1U, top + 1U, right - 1U, bottom - 1U);
 }
 
 /**
@@ -217,8 +261,7 @@ static bool MotorDirectionUI_TextPixel(uint16_t x,
 static uint16_t MotorDirectionUI_GetLogicalPixel(
     uint16_t x,
     uint16_t y,
-    MotorDirectionUiPowerState_t power_state,
-    uint8_t selected_motor)
+    const MotorDirectionUiView_t *view)
 {
     uint16_t color = UI_COLOR_BACKGROUND;
     uint8_t motor_index;
@@ -253,24 +296,34 @@ static uint16_t MotorDirectionUI_GetLogicalPixel(
 
     if (MotorDirectionUI_TextPixel(
             x, y,
-            (power_state == MOTOR_DIRECTION_UI_POWER_ON) ? 5U : 22U,
+            (view->power_state == MOTOR_DIRECTION_UI_POWER_ON) ? 5U : 22U,
             5U,
-            (power_state == MOTOR_DIRECTION_UI_POWER_ON) ? "ON" : "OFF"))
+            (view->power_state == MOTOR_DIRECTION_UI_POWER_ON) ? "ON" : "OFF"))
     {
-        color = (power_state == MOTOR_DIRECTION_UI_POWER_ON)
+        color = (view->power_state == MOTOR_DIRECTION_UI_POWER_ON)
                     ? UI_COLOR_STATUS_ON
                     : UI_COLOR_STATUS_OFF;
     }
 
     if (MotorDirectionUI_PointInCircle(
             x, y,
-            (power_state == MOTOR_DIRECTION_UI_POWER_ON) ? 34U : 11U,
+            (view->power_state == MOTOR_DIRECTION_UI_POWER_ON) ? 34U : 11U,
             11U,
             7U))
     {
-        color = (power_state == MOTOR_DIRECTION_UI_POWER_ON)
+        color = (view->power_state == MOTOR_DIRECTION_UI_POWER_ON)
                     ? UI_COLOR_STATUS_ON
                     : UI_COLOR_STATUS_OFF;
+    }
+
+    /*
+     * 开关焦点使用45x21胶囊形轮廓，大小覆盖整个滑动开关，同时与页面
+     * 外框保留间隔。它只表示当前操作目标，不改变OFF/ON状态颜色。
+     */
+    if ((view->focus == MOTOR_DIRECTION_UI_FOCUS_SWITCH) &&
+        MotorDirectionUI_PointOnCapsuleBorder(x, y, 1U, 1U, 45U, 21U))
+    {
+        color = UI_COLOR_FOCUS_SWITCH;
     }
 
     /* 顶部图例：上三角=NOR，下三角=REV，中间竖线用于视觉分隔。 */
@@ -311,12 +364,13 @@ static uint16_t MotorDirectionUI_GetLogicalPixel(
             '\0'
         };
 
-        /* 当前选中的电机编号外侧显示黄色方框，与蓝灰色页面边框区分。 */
-        if ((selected_motor == (uint8_t)(motor_index + 1U)) &&
+        /* 通道焦点使用柔白色19x19方框，与青色编号和蓝灰外框区分。 */
+        if ((view->focus == MOTOR_DIRECTION_UI_FOCUS_MOTOR) &&
+            (view->selected_motor == (uint8_t)(motor_index + 1U)) &&
             MotorDirectionUI_PointOnRectangleBorder(
                 x, y, center_x - 9U, 37U, center_x + 9U, 55U))
         {
-            color = UI_COLOR_FOCUS;
+            color = UI_COLOR_FOCUS_MOTOR;
         }
 
         if (MotorDirectionUI_TextPixel(
@@ -338,45 +392,246 @@ static uint16_t MotorDirectionUI_GetLogicalPixel(
         {
             color = UI_COLOR_DOWN;
         }
+
+        /*
+         * 方向焦点是27x24矩形，比数字焦点明显更大，并包围所选通道的
+         * NOR或REV三角形。UP固定选择上方NOR，DOWN固定选择下方REV。
+         */
+        if ((view->focus == MOTOR_DIRECTION_UI_FOCUS_DIRECTION) &&
+            (view->selected_motor == (uint8_t)(motor_index + 1U)))
+        {
+            const uint16_t focus_top =
+                (view->selected_direction == MOTOR_DIRECTION_UI_NORMAL)
+                    ? 55U
+                    : 90U;
+            const uint16_t focus_bottom =
+                (view->selected_direction == MOTOR_DIRECTION_UI_NORMAL)
+                    ? 78U
+                    : 113U;
+
+            if (MotorDirectionUI_PointOnRectangleBorder(
+                    x, y, center_x - 13U, focus_top,
+                    center_x + 13U, focus_bottom))
+            {
+                color = UI_COLOR_FOCUS_DIRECTION;
+            }
+        }
     }
 
     return color;
 }
 
-void MotorDirectionUI_Draw(MotorDirectionUiPowerState_t power_state,
-                           uint8_t selected_motor)
+/** @brief 复制并校验视图状态，非法字段回退到安全显示值。 */
+static void MotorDirectionUI_ValidateView(
+    const MotorDirectionUiView_t *source,
+    MotorDirectionUiView_t *destination)
 {
-    uint16_t physical_x;
-    uint16_t physical_y;
-
-    /* 非法状态按更安全的OFF显示，避免界面错误地提示输出已经启用。 */
-    if ((power_state != MOTOR_DIRECTION_UI_POWER_OFF) &&
-        (power_state != MOTOR_DIRECTION_UI_POWER_ON))
+    if (destination == NULL)
     {
-        power_state = MOTOR_DIRECTION_UI_POWER_OFF;
+        return;
     }
 
-    /*
-     * 一次性选择完整的120x240物理显存窗口，然后按控制器要求的行优先顺序
-     * 连续写像素。相比逐点调用LCD_Address_Set，此方式只设置一次窗口。
-     */
-    LCD_Address_Set(0U, 0U, LCD_W - 1U, LCD_H - 1U);
+    *destination = (source != NULL) ? *source : g_safe_default_view;
 
-    for (physical_y = 0U; physical_y < LCD_H; ++physical_y)
+    if ((destination->power_state != MOTOR_DIRECTION_UI_POWER_OFF) &&
+        (destination->power_state != MOTOR_DIRECTION_UI_POWER_ON))
     {
-        for (physical_x = 0U; physical_x < LCD_W; ++physical_x)
+        destination->power_state = MOTOR_DIRECTION_UI_POWER_OFF;
+    }
+    if ((destination->focus != MOTOR_DIRECTION_UI_FOCUS_SWITCH) &&
+        (destination->focus != MOTOR_DIRECTION_UI_FOCUS_MOTOR) &&
+        (destination->focus != MOTOR_DIRECTION_UI_FOCUS_DIRECTION))
+    {
+        destination->focus = MOTOR_DIRECTION_UI_FOCUS_SWITCH;
+    }
+    if ((destination->selected_motor < 1U) ||
+        (destination->selected_motor > UI_MOTOR_COUNT))
+    {
+        destination->selected_motor = 1U;
+    }
+    if ((destination->selected_direction != MOTOR_DIRECTION_UI_NORMAL) &&
+        (destination->selected_direction != MOTOR_DIRECTION_UI_REVERSED))
+    {
+        destination->selected_direction = MOTOR_DIRECTION_UI_NORMAL;
+    }
+}
+
+/**
+ * @brief 绘制一个包含端点的240x120逻辑矩形区域。
+ *
+ * 逻辑画布旋转90度写入物理显存。每生成一条物理扫描行后，将该行全部
+ * RGB565字节交给LCD_WriteDataBuffer()一次发送，避免逐像素调用HAL。
+ */
+static void MotorDirectionUI_DrawLogicalRegion(
+    const MotorDirectionUiView_t *view,
+    uint16_t logical_left,
+    uint16_t logical_top,
+    uint16_t logical_right,
+    uint16_t logical_bottom)
+{
+    uint16_t physical_left;
+    uint16_t physical_right;
+    uint16_t physical_top;
+    uint16_t physical_bottom;
+
+    if ((view == NULL) ||
+        (logical_left > logical_right) ||
+        (logical_top > logical_bottom) ||
+        (logical_left >= UI_LOGICAL_WIDTH) ||
+        (logical_top >= UI_LOGICAL_HEIGHT))
+    {
+        return;
+    }
+
+    if (logical_right >= UI_LOGICAL_WIDTH)
+    {
+        logical_right = UI_LOGICAL_WIDTH - 1U;
+    }
+    if (logical_bottom >= UI_LOGICAL_HEIGHT)
+    {
+        logical_bottom = UI_LOGICAL_HEIGHT - 1U;
+    }
+
+    /* logical_x=physical_y，logical_y=119-physical_x。 */
+    physical_left = (UI_LOGICAL_HEIGHT - 1U) - logical_bottom;
+    physical_right = (UI_LOGICAL_HEIGHT - 1U) - logical_top;
+    physical_top = logical_left;
+    physical_bottom = logical_right;
+
+    /*
+     * SH8501显存列窗口按4像素边界处理。向外扩展局部区域不会改变业务
+     * 内容，只会多重画边缘最多3列，并避免非对齐列地址造成显示异常。
+     */
+    physical_left &= (uint16_t)~3U;
+    physical_right |= 3U;
+    if (physical_right >= LCD_W)
+    {
+        physical_right = LCD_W - 1U;
+    }
+
+    LCD_Address_Set(physical_left,
+                    physical_top,
+                    physical_right,
+                    physical_bottom);
+
+    for (uint16_t physical_y = physical_top;
+         physical_y <= physical_bottom;
+         ++physical_y)
+    {
+        uint16_t buffer_index = 0U;
+
+        for (uint16_t physical_x = physical_left;
+             physical_x <= physical_right;
+             ++physical_x)
         {
-            /*
-             * 240x120逻辑画布顺时针旋转后写入120x240显存：
-             * logical_x = physical_y
-             * logical_y = 119 - physical_x
-             */
             const uint16_t logical_x = physical_y;
             const uint16_t logical_y =
                 (UI_LOGICAL_HEIGHT - 1U) - physical_x;
+            const uint16_t color = MotorDirectionUI_GetLogicalPixel(
+                logical_x, logical_y, view);
 
-            LCD_WR_DATA(MotorDirectionUI_GetLogicalPixel(
-                logical_x, logical_y, power_state, selected_motor));
+            g_ui_physical_row_buffer[buffer_index++] =
+                (uint8_t)(color >> 8);
+            g_ui_physical_row_buffer[buffer_index++] = (uint8_t)color;
         }
+
+        LCD_WriteDataBuffer(g_ui_physical_row_buffer, buffer_index);
+    }
+}
+
+/** @brief 用当前视图内容重画某个旧/新焦点可能覆盖的最小区域。 */
+static void MotorDirectionUI_DrawFocusRegion(
+    const MotorDirectionUiView_t *current_view,
+    MotorDirectionUiFocus_t focus,
+    uint8_t motor,
+    MotorDirectionUiDirection_t direction)
+{
+    if (focus == MOTOR_DIRECTION_UI_FOCUS_SWITCH)
+    {
+        MotorDirectionUI_DrawLogicalRegion(
+            current_view, 0U, 0U, 46U, 22U);
+    }
+    else if (focus == MOTOR_DIRECTION_UI_FOCUS_MOTOR)
+    {
+        const uint16_t center_x = UI_MOTOR_FIRST_CENTER_X +
+            ((uint16_t)(motor - 1U) * UI_MOTOR_COLUMN_PITCH);
+
+        MotorDirectionUI_DrawLogicalRegion(
+            current_view, center_x - 10U, 36U, center_x + 10U, 56U);
+    }
+    else if (focus == MOTOR_DIRECTION_UI_FOCUS_DIRECTION)
+    {
+        const uint16_t center_x = UI_MOTOR_FIRST_CENTER_X +
+            ((uint16_t)(motor - 1U) * UI_MOTOR_COLUMN_PITCH);
+        const uint16_t top =
+            (direction == MOTOR_DIRECTION_UI_NORMAL) ? 54U : 89U;
+        const uint16_t bottom =
+            (direction == MOTOR_DIRECTION_UI_NORMAL) ? 79U : 114U;
+
+        MotorDirectionUI_DrawLogicalRegion(
+            current_view, center_x - 14U, top, center_x + 14U, bottom);
+    }
+    else
+    {
+        /* 状态已经过校验，正常路径不会到达这里。 */
+    }
+}
+
+void MotorDirectionUI_Draw(const MotorDirectionUiView_t *view)
+{
+    MotorDirectionUiView_t validated_view;
+
+    /* NULL和任何非法字段都回退到安全状态，绝不错误显示为已经ON。 */
+    MotorDirectionUI_ValidateView(view, &validated_view);
+
+    /*
+     * 初次显示仍绘制完整页面，但底层已经改为每条扫描行批量发送，而不是
+     * 每像素调用两次HAL_SPI_Transmit。
+     */
+    MotorDirectionUI_DrawLogicalRegion(
+        &validated_view,
+        0U,
+        0U,
+        UI_LOGICAL_WIDTH - 1U,
+        UI_LOGICAL_HEIGHT - 1U);
+}
+
+void MotorDirectionUI_Update(const MotorDirectionUiView_t *previous_view,
+                             const MotorDirectionUiView_t *current_view)
+{
+    MotorDirectionUiView_t previous;
+    MotorDirectionUiView_t current;
+
+    if ((previous_view == NULL) || (current_view == NULL))
+    {
+        MotorDirectionUI_Draw(current_view);
+        return;
+    }
+
+    MotorDirectionUI_ValidateView(previous_view, &previous);
+    MotorDirectionUI_ValidateView(current_view, &current);
+
+    /* OFF/ON文字和滑块位置变化时必须重画完整开关区域。 */
+    if (previous.power_state != current.power_state)
+    {
+        MotorDirectionUI_DrawLogicalRegion(
+            &current, 0U, 0U, 46U, 22U);
+    }
+
+    if ((previous.focus != current.focus) ||
+        (previous.selected_motor != current.selected_motor) ||
+        (previous.selected_direction != current.selected_direction))
+    {
+        /* 先用新页面状态擦除旧焦点，再绘制新焦点。 */
+        MotorDirectionUI_DrawFocusRegion(
+            &current,
+            previous.focus,
+            previous.selected_motor,
+            previous.selected_direction);
+        MotorDirectionUI_DrawFocusRegion(
+            &current,
+            current.focus,
+            current.selected_motor,
+            current.selected_direction);
     }
 }

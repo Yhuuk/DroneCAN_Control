@@ -19,6 +19,31 @@ static void LCD_SPI_WriteByte(uint8_t data)
     HAL_GPIO_WritePin(OLED_CS_GPIO_Port, OLED_CS_Pin, GPIO_PIN_SET);
 }
 
+void LCD_WriteDataBuffer(const uint8_t *data, uint16_t length)
+{
+    if ((data == NULL) || (length == 0U))
+    {
+        return;
+    }
+
+    /*
+     * 显存数据允许在CS持续为低期间连续传输。与逐字节写法相比，这里只
+     * 进入一次HAL发送循环并只切换一次CS，是刷新提速的关键。HAL不会
+     * 修改发送缓冲区；强制转换仅用于兼容其未声明const的接口参数。
+     */
+    HAL_GPIO_WritePin(OLED_DC_GPIO_Port, OLED_DC_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(OLED_CS_GPIO_Port, OLED_CS_Pin, GPIO_PIN_RESET);
+    if (HAL_SPI_Transmit(&hspi1,
+                         (uint8_t *)data,
+                         length,
+                         LCD_SPI_TIMEOUT_MS) != HAL_OK)
+    {
+        HAL_GPIO_WritePin(OLED_CS_GPIO_Port, OLED_CS_Pin, GPIO_PIN_SET);
+        Error_Handler();
+    }
+    HAL_GPIO_WritePin(OLED_CS_GPIO_Port, OLED_CS_Pin, GPIO_PIN_SET);
+}
+
 /** @brief 向屏幕写一个命令字节（DC=0）。 */
 void LCD_WR_REG(uint8_t reg)
 {
@@ -39,21 +64,37 @@ void LCD_WR_DATA8(uint8_t data)
 /** @brief 向屏幕写一个 RGB565 像素，高字节先发送。 */
 void LCD_WR_DATA(uint16_t data)
 {
-    HAL_GPIO_WritePin(OLED_DC_GPIO_Port, OLED_DC_Pin, GPIO_PIN_SET);
-    LCD_SPI_WriteByte((uint8_t)(data >> 8));
-    LCD_SPI_WriteByte((uint8_t)data);
+    const uint8_t pixel_bytes[2] = {
+        (uint8_t)(data >> 8),
+        (uint8_t)data
+    };
+
+    LCD_WriteDataBuffer(pixel_bytes, (uint16_t)sizeof(pixel_bytes));
 }
 
 /**
  * @brief 连续写入相同颜色，供区域填充使用。
- * @note  诊断阶段保留原示例逐像素、逐字节的 CS 时序，不做批量发送优化。
+ * @note  使用64像素的小缓冲区分块发送，不需要占用整屏帧缓冲区。
  */
 static void LCD_WriteColorRepeat(uint16_t color, uint32_t count)
 {
+    uint8_t color_buffer[64U * 2U];
+
+    for (uint16_t index = 0U; index < 64U; ++index)
+    {
+        color_buffer[index * 2U] = (uint8_t)(color >> 8);
+        color_buffer[(index * 2U) + 1U] = (uint8_t)color;
+    }
+
     while (count > 0U)
     {
-        LCD_WR_DATA(color);
-        --count;
+        const uint16_t pixels_this_transfer =
+            (count > 64U) ? 64U : (uint16_t)count;
+
+        LCD_WriteDataBuffer(
+            color_buffer,
+            (uint16_t)(pixels_this_transfer * 2U));
+        count -= pixels_this_transfer;
     }
 }
 

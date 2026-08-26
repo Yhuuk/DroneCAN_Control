@@ -29,7 +29,6 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "lcd_init.h"
-#include "motor_direction_ui.h"
 
 /* USER CODE END Includes */
 
@@ -152,18 +151,11 @@ int main(void)
 
   LCD_Init();
 
-  /*
-   * 启动阶段先显示电机方向页面的静态效果：
-   * - 默认输出状态为OFF；
-   * - 默认选中1号电机；
-   * - 此处仅绘制界面，不会发送任何电机方向或油门命令。
-   * 后续接入UI状态机后，再由显示任务根据实际状态刷新局部内容。
-   */
-  MotorDirectionUI_Draw(MOTOR_DIRECTION_UI_POWER_OFF, 1U);
+  /* 页面初始绘制和后续刷新统一由FreeRTOS的UiTask负责。 */
 
-  HAL_GPIO_WritePin(Throttle_LED_GPIO_Port, Throttle_LED_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(Direction_LED_GPIO_Port, Direction_LED_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(CAN_LED_GPIO_Port, CAN_LED_Pin, GPIO_PIN_RESET);
+  // HAL_GPIO_WritePin(Throttle_LED_GPIO_Port, Throttle_LED_Pin, GPIO_PIN_RESET);
+  // HAL_GPIO_WritePin(Direction_LED_GPIO_Port, Direction_LED_Pin, GPIO_PIN_RESET);
+  // HAL_GPIO_WritePin(CAN_LED_GPIO_Port, CAN_LED_Pin, GPIO_PIN_RESET);
 #endif
 
   /* USER CODE END 2 */
