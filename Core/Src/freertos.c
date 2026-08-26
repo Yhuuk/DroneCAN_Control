@@ -43,7 +43,7 @@
 /* USER CODE BEGIN PD */
 
 /** InputTask每10个RTOS Tick扫描一次按键；当前1 Tick等于1 ms。 */
-#define INPUT_KEY_SCAN_PERIOD_TICKS 10U
+#define INPUT_KEY_SCAN_PERIOD_TICKS KEY_INPUT_SCAN_PERIOD_MS
 
 /**
  * 方向命令是低频用户操作，长度8足以吸收短时间内的按键事件，同时又不会
@@ -69,6 +69,8 @@ osMessageQueueId_t CanCommandQueueHandle;
 
 /* 以下变量只用于调试器观察运行情况，不参与控制逻辑。 */
 volatile uint32_t g_key_press_count[KEY_ID_COUNT];
+volatile uint32_t g_key_short_press_count[KEY_ID_COUNT];
+volatile uint32_t g_key_long_press_count[KEY_ID_COUNT];
 volatile uint32_t g_input_command_queued_count;
 volatile uint32_t g_input_queue_full_count;
 volatile uint32_t g_input_direction_conflict_count;
@@ -79,12 +81,12 @@ volatile uint32_t g_can_tx_error_count;
 volatile int16_t g_last_direction_enqueue_result;
 
 /* USER CODE END Variables */
-/* Definitions for defaultTask */
-osThreadId_t defaultTaskHandle;
-const osThreadAttr_t defaultTask_attributes = {
-  .name = "defaultTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityLow,
+/* Definitions for UiTask */
+osThreadId_t UiTaskHandle;
+const osThreadAttr_t UiTask_attributes = {
+  .name = "UiTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityBelowNormal,
 };
 /* Definitions for CanTask */
 osThreadId_t CanTaskHandle;
@@ -109,7 +111,7 @@ static void CanTask_HandleCommand(const CanCommand_t *command);
 
 /* USER CODE END FunctionPrototypes */
 
-void StartDefaultTask(void *argument);
+void StartUiTask(void *argument);
 void StartCanTask(void *argument);
 void StartInputTask(void *argument);
 
@@ -189,8 +191,8 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* creation of defaultTask */
-  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+  /* creation of UiTask */
+  UiTaskHandle = osThreadNew(StartUiTask, NULL, &UiTask_attributes);
 
   /* creation of CanTask */
   CanTaskHandle = osThreadNew(StartCanTask, NULL, &CanTask_attributes);
@@ -208,22 +210,22 @@ void MX_FREERTOS_Init(void) {
 
 }
 
-/* USER CODE BEGIN Header_StartDefaultTask */
+/* USER CODE BEGIN Header_StartUiTask */
 /**
-  * @brief  Function implementing the defaultTask thread.
+  * @brief  Function implementing the UiTask thread.
   * @param  argument: Not used
   * @retval None
   */
-/* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void *argument)
+/* USER CODE END Header_StartUiTask */
+void StartUiTask(void *argument)
 {
-  /* USER CODE BEGIN StartDefaultTask */
+  /* USER CODE BEGIN StartUiTask */
   /* Infinite loop */
   for(;;)
   {
     osDelay(1);
   }
-  /* USER CODE END StartDefaultTask */
+  /* USER CODE END StartUiTask */
 }
 
 /* USER CODE BEGIN Header_StartCanTask */
@@ -300,7 +302,7 @@ void StartCanTask(void *argument)
 void StartInputTask(void *argument)
 {
   /* USER CODE BEGIN StartInputTask */
-  KeyEvent_t key_events[KEY_ID_COUNT];
+  KeyEvent_t key_events[KEY_INPUT_MAX_EVENTS_PER_SCAN];
   uint32_t next_wake_tick;
 
   (void)argument;
@@ -319,7 +321,7 @@ void StartInputTask(void *argument)
     bool down_pressed = false;
     const uint8_t event_count = KeyInput_Scan(
         key_events,
-        (uint8_t)KEY_ID_COUNT);
+        (uint8_t)KEY_INPUT_MAX_EVENTS_PER_SCAN);
 
     /*
      * KeyInput_Scan会同时维护5个按键。当前阶段只有UP和DOWN映射为电机
@@ -330,16 +332,31 @@ void StartInputTask(void *argument)
     {
       const KeyEvent_t *const event = &key_events[index];
 
-      if (event->event_type != KEY_EVENT_PRESSED)
+      if ((uint32_t)event->key_id >= (uint32_t)KEY_ID_COUNT)
       {
-        /* 当前业务只关心稳定按下；释放事件仍由状态机生成供以后使用。 */
+        /* 防御无效按键编号，避免调试计数数组越界。 */
         continue;
       }
 
-      if ((uint32_t)event->key_id < (uint32_t)KEY_ID_COUNT)
+      if (event->event_type == KEY_EVENT_SHORT_PRESS)
       {
-        g_key_press_count[event->key_id]++;
+        g_key_short_press_count[event->key_id]++;
+        continue;
       }
+
+      if (event->event_type == KEY_EVENT_LONG_PRESS)
+      {
+        g_key_long_press_count[event->key_id]++;
+        continue;
+      }
+
+      if (event->event_type != KEY_EVENT_PRESSED)
+      {
+        /* RELEASED暂时不参与业务，后续UiTask可按需使用。 */
+        continue;
+      }
+
+      g_key_press_count[event->key_id]++;
 
       if (event->key_id == KEY_ID_UP)
       {
@@ -355,28 +372,6 @@ void StartInputTask(void *argument)
       }
     }
 
-    if (up_pressed && down_pressed)
-    {
-      /*
-       * 同一扫描周期内同时确认UP和DOWN会产生互相矛盾的Normal/Reversed
-       * 请求。为避免执行顺序决定最终方向，本次两个请求全部忽略。
-       */
-      g_input_direction_conflict_count++;
-    }
-    else if (up_pressed)
-    {
-      /* UP稳定按下一次：请求将1号电机明确设置为Normal。 */
-      InputTask_PostDirectionCommand(MOTOR_DIRECTION_NORMAL);
-    }
-    else if (down_pressed)
-    {
-      /* DOWN稳定按下一次：请求将1号电机明确设置为Reversed。 */
-      InputTask_PostDirectionCommand(MOTOR_DIRECTION_REVERSED);
-    }
-    else
-    {
-      /* 本周期没有新的方向按下事件。 */
-    }
 
     /*
      * 使用绝对周期延时，避免状态机执行时间长期累积到扫描周期中。
@@ -397,30 +392,30 @@ void StartInputTask(void *argument)
  * 本函数不调用任何libcanard函数。发送到队列的是结构体副本，所以局部
  * 变量command在函数返回后失效不会影响CanTask读取消息。
  */
-static void InputTask_PostDirectionCommand(MotorDirection_t direction)
-{
-  const CanCommand_t command = {
-      .command_type = CAN_COMMAND_SET_DIRECTION,
-      .motor_mask = 0x01U, /* 当前阶段固定选择第1路电机。 */
-      .direction = direction
-  };
+// static void InputTask_PostDirectionCommand(MotorDirection_t direction)
+// {
+//   const CanCommand_t command = {
+//       .command_type = CAN_COMMAND_SET_DIRECTION,
+//       .motor_mask = 0x01U, /* 当前阶段固定选择第1路电机。 */
+//       .direction = direction
+//   };
 
-  /*
-   * 方向按键是离散事件，不应阻塞InputTask等待队列空间。队列满时记录
-   * 错误并丢弃本次请求，避免旧命令积压后在用户未预期的时刻执行。
-   */
-  if (osMessageQueuePut(CanCommandQueueHandle,
-                        &command,
-                        0U,
-                        0U) == osOK)
-  {
-    g_input_command_queued_count++;
-  }
-  else
-  {
-    g_input_queue_full_count++;
-  }
-}
+//   /*
+//    * 方向按键是离散事件，不应阻塞InputTask等待队列空间。队列满时记录
+//    * 错误并丢弃本次请求，避免旧命令积压后在用户未预期的时刻执行。
+//    */
+//   if (osMessageQueuePut(CanCommandQueueHandle,
+//                         &command,
+//                         0U,
+//                         0U) == osOK)
+//   {
+//     g_input_command_queued_count++;
+//   }
+//   else
+//   {
+//     g_input_queue_full_count++;
+//   }
+// }
 
 /**
  * @brief 在CanTask上下文中把应用命令转换为DroneCAN方向消息。

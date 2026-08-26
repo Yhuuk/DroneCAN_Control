@@ -3,6 +3,14 @@
 
 #include <stdint.h>
 
+/*
+ * InputTask必须按照该周期调用KeyInput_Scan()，因为消抖和长按时间均由
+ * 扫描次数换算。后续若修改扫描周期，应同时检查按键手感和任务周期。
+ */
+#define KEY_INPUT_SCAN_PERIOD_MS       10U
+#define KEY_INPUT_DEBOUNCE_TIME_MS     30U
+#define KEY_INPUT_LONG_PRESS_TIME_MS  800U
+
 /**
  * @brief 控制器面板上的物理按键编号。
  *
@@ -19,6 +27,12 @@ typedef enum
     KEY_ID_SWITCH,
     KEY_ID_COUNT
 } KeyId_t;
+
+/*
+ * 一个按键稳定释放时可能同时产生SHORT_PRESS和RELEASED两条事件，因此
+ * 最坏情况下5个按键同一扫描周期释放，需要容纳KEY_ID_COUNT * 2条事件。
+ */
+#define KEY_INPUT_MAX_EVENTS_PER_SCAN (KEY_ID_COUNT * 2U)
 
 /**
  * @brief 单个按键的消抖状态。
@@ -51,11 +65,25 @@ typedef enum
     KEY_STATE_DEBOUNCE_RELEASE
 } KeyState_t;
 
-/** @brief 状态机对外产生的离散按键事件。 */
+/**
+ * @brief 状态机对外产生的离散按键事件。
+ *
+ * PRESSED/RELEASED描述消抖后的物理边沿；SHORT_PRESS/LONG_PRESS描述用户
+ * 动作。UI业务应优先使用SHORT_PRESS和LONG_PRESS，而不是自行计算时间。
+ */
 typedef enum
 {
+    /** 按键经过按下消抖，刚进入稳定按下状态。 */
     KEY_EVENT_PRESSED = 0,
-    KEY_EVENT_RELEASED
+
+    /** 按键经过释放消抖，刚回到稳定松开状态。 */
+    KEY_EVENT_RELEASED,
+
+    /** 稳定按下不足800 ms后松开；在确认释放时产生一次。 */
+    KEY_EVENT_SHORT_PRESS,
+
+    /** 稳定按住达到800 ms；达到阈值时产生一次，继续按住不会重复。 */
+    KEY_EVENT_LONG_PRESS
 } KeyEventType_t;
 
 /** @brief 一条按键事件，包含按键编号和动作类型。 */
@@ -77,8 +105,9 @@ void KeyInput_Init(void);
 /**
  * @brief 扫描全部5个按键并推进各自的消抖状态机。
  *
- * InputTask应每10 ms调用一次。本函数最多为每个按键产生一条事件，
- * 因此调用方通常提供KEY_ID_COUNT个KeyEvent_t的数组。
+ * InputTask应每KEY_INPUT_SCAN_PERIOD_MS调用一次。稳定释放一个短按时会
+ * 同时产生SHORT_PRESS和RELEASED，因此调用方应提供至少
+ * KEY_INPUT_MAX_EVENTS_PER_SCAN个KeyEvent_t的数组。
  *
  * @param[out] events      用于保存本次扫描产生的事件。
  * @param[in]  max_events  events数组最多能够保存的事件数量。
