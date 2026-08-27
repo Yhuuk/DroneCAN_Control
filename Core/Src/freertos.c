@@ -66,8 +66,8 @@
 /** 一次反馈固定包含3次完整的“亮→灭”。 */
 #define DIRECTION_LED_FLASH_COUNT 3U
 
-/**蜂鸣器快速响100ms */
-#define DIRECTION_BUZZ_DURATION_MS 100U
+/**蜂鸣器快速响400ms，400ms这个鸣叫时间我觉得刚刚好 */
+#define DIRECTION_BUZZ_DURATION_MS 400U
 
 /* USER CODE END PD */
 
@@ -356,8 +356,20 @@ void StartUiTask(void *argument)
   for(;;)
   {
     /*
+     * osMessageQueueGet(
+     * 哪个消息队列,
+     * 消息取出来放在哪里,
+     * 是否需要获得消息优先级,
+     * 最长等待多久
+     * );
+     * 
+     * UiEventQueueHandle 是消息队列句柄
+     * 想想是怎么把数据传向 event 这个结构体的
+     * 
      * 没有按键动作时永久阻塞，任务不占用CPU时间。InputTask写入一条
      * UiInputEvent_t后本任务被唤醒；只有状态真的改变才刷新屏幕。
+     * 
+     * osWaitForever 是
      */
     if (osMessageQueueGet(UiEventQueueHandle,
                           &event,
@@ -532,7 +544,7 @@ void StartInputTask(void *argument)
 /* USER CODE BEGIN Application */
 
 /**
- * @brief 把按键层事件转换为UI输入事件并非阻塞地放入UiEventQueue。
+ * @brief 把按键层事件转换为UI输入事件并 非阻塞地放入UiEventQueue。
  *
  * PRESSED和RELEASED是物理边沿，本页面不使用；调用方只会传入SHORT_PRESS
  * 或LONG_PRESS。0超时表示队列满时立即返回，不能阻塞固定周期的InputTask。
