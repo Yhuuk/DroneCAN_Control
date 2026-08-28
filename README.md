@@ -35,3 +35,16 @@ osMessageQueuePut(UiEventQueueHandle,
                         0U) == osOK
 ```
  就是同一个消息队列中的生产者和消费者。
+
+ 3. `osKernelGetTickCount()` 是获取当前 rtos 的系统节拍计数值。它在系统启动后一直递增。
+ 4. 
+
+ | 成员 | 作用 |
+|---|---|
+| `waiting_for_result` | 是否已经把命令交给CanTask，并等待CanTask返回本地处理结果 |
+| `protection_active` | 是否处于2秒重复命令保护期 |
+| `pending_token` | 当前正在等待的命令编号 |
+| `pending_motor_mask` | 当前等待命令对应的电机 |
+| `pending_direction` | 当前等待命令设置的方向 |
+| `next_token` | 下一条新命令应该使用的编号 |
+| `protection_deadline_tick` | 保护结束的系统Tick时刻 |

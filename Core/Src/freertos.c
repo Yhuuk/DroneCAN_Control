@@ -39,6 +39,35 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+/**
+ * @brief UiTask私有的方向命令提交状态。
+ *
+ * 该结构体只在UiTask上下文中读写，不会被CanTask或软件定时器直接访问，
+ * 因此无需volatile和互斥锁。
+ * 
+ */
+typedef struct
+{
+  /** true表示已经提交命令，但尚未收到CanTask的本地处理结果。 */
+  bool waiting_for_result;
+
+  /** true表示2秒重复发送保护窗口仍然有效。 */
+  bool protection_active;
+
+  /** 当前等待结果的命令关联号。 也就是正要准备发送转向命令的编号*/
+  uint16_t pending_token;
+
+  /** 用于校验CanTask返回结果是否确实属于当前命令。 */
+  uint8_t pending_motor_mask;
+  MotorDirection_t pending_direction;
+
+  /** 下一条命令使用的关联号；0保留为“无关联号”。 */
+  uint16_t next_token;
+
+  /** 使用RTOS Tick表示的保护截止时刻。 */
+  uint32_t protection_deadline_tick;
+} UiDirectionCommandControl_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -69,6 +98,12 @@
 /**蜂鸣器快速响400ms，400ms这个鸣叫时间我觉得刚刚好 */
 #define DIRECTION_BUZZ_DURATION_MS 400U
 
+/**
+ * 接收板执行一次DShot方向修改约需1.59秒。在上一条命令提交后的2秒内
+ * 禁止再次提交方向命令，避免接收板忙碌时重复触发或切换其它通道。
+ */
+#define DIRECTION_COMMAND_PROTECTION_TIME_MS 2000U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -80,14 +115,15 @@
 /* USER CODE BEGIN Variables */
 
 /**
- * 后续UiTask是该队列的生产者，CanTask是消费者。当前UI阶段尚不向该
- * 队列提交命令，但保留已经完成的CAN任务架构供下一阶段接入。
+ * UiTask是该队列的生产者，CanTask是唯一消费者。队列传递结构体副本，
+ * UiTask不直接接触libcanard；CanTask负责协议封装和CAN发送资源。
  */
 osMessageQueueId_t CanCommandQueueHandle;
 
 /**
- * InputTask是该队列的唯一生产者，UiTask是唯一消费者。队列中保存的是
- * UiInputEvent_t结构体副本，不共享局部变量地址，也不要求两个任务加锁。
+ * InputTask和CanTask是该队列的生产者，UiTask是唯一消费者。队列中保存
+ * UiEventMessage_t副本：按键动作和CAN命令结果都由UiTask串行处理，
+ * 不共享局部变量地址，也不要求多个任务直接操作UI状态。
  */
 osMessageQueueId_t UiEventQueueHandle;
 
@@ -127,6 +163,20 @@ volatile uint32_t g_can_command_rejected_count;
 volatile uint32_t g_can_tx_busy_count;
 volatile uint32_t g_can_tx_error_count;
 volatile int16_t g_last_direction_enqueue_result;
+/** UiTask已经成功放入CanCommandQueue的方向命令数量。 */
+volatile uint32_t g_ui_direction_command_submitted_count;
+/** 因CanCommandQueue已满而未能提交的方向命令数量。 */
+volatile uint32_t g_ui_direction_command_queue_full_count;
+/** 因2秒保护窗口或等待CanTask结果而被忽略的重复长按数量。 */
+volatile uint32_t g_ui_direction_command_protected_count;
+/** UiTask收到并匹配成功的CanTask受理结果数量。 */
+volatile uint32_t g_ui_direction_command_accepted_count;
+/** UiTask收到并匹配成功的CanTask拒绝结果数量。 */
+volatile uint32_t g_ui_direction_command_rejected_count;
+/** 关联号不匹配的迟到或无效CanTask结果数量。 */
+volatile uint32_t g_ui_direction_command_stale_result_count;
+/** CanTask无法把关键命令结果放入UiEventQueue的次数。 */
+volatile uint32_t g_can_result_event_queue_full_count;
 
 /* USER CODE END Variables */
 /* Definitions for UiTask */
@@ -156,12 +206,23 @@ const osThreadAttr_t InputTask_attributes = {
 
 static void InputTask_PostUiEvent(const KeyEvent_t *key_event);
 static bool UiTask_HandleInputEvent(MotorDirectionUiView_t *view,
+                                    UiDirectionCommandControl_t *control,
                                     const UiInputEvent_t *event);
+static bool UiTask_SubmitDirectionCommand(
+    const MotorDirectionUiView_t *view,
+    UiDirectionCommandControl_t *control);
+static void UiTask_HandleCanCommandResult(
+    UiDirectionCommandControl_t *control,
+    const CanCommandResult_t *result);
+static bool UiTask_DirectionCommandIsProtected(
+    UiDirectionCommandControl_t *control);
 static void DirectionLedFeedback_Start(void);
 static void DirectionLedTimerCallback(void *argument);
 static void DirectionBuzzTimerCallback(void *argument);
 static void DirectionBuzzFeedback(void);
-static void CanTask_HandleCommand(const CanCommand_t *command);
+static void CanTask_HandleCommand(const CanCommand_t *command,
+                                  CanCommandResult_t *result);
+static void CanTask_PostCommandResult(const CanCommandResult_t *result);
 
 /* USER CODE END FunctionPrototypes */
 
@@ -283,14 +344,14 @@ void MX_FREERTOS_Init(void) {
   }
 
   /*
-   * 创建InputTask到UiTask的输入队列：
-   * - 每条消息是一个UiInputEvent_t结构体副本；
-   * - 这里只传递已确认的短按/长按，不传递GPIO电平和消抖内部状态；
-   * - UiTask因此可以阻塞等待事件，不需要周期轮询按键。
+   * 创建发送给UiTask的统一事件队列：
+   * - InputTask放入已确认的短按/长按，不传递GPIO电平和消抖状态；
+   * - CanTask放入方向命令的本地受理/拒绝结果；
+   * - 每条消息均带类型，UiTask可永久阻塞等待，不需要轮询两个队列。
    */
   UiEventQueueHandle = osMessageQueueNew(
       UI_EVENT_QUEUE_LENGTH,
-      sizeof(UiInputEvent_t),
+      sizeof(UiEventMessage_t),
       NULL);
 
   if (UiEventQueueHandle == NULL)
@@ -336,7 +397,18 @@ void StartUiTask(void *argument)
       .selected_motor = 1U,
       .selected_direction = MOTOR_DIRECTION_UI_NORMAL
   };
-  UiInputEvent_t event;
+  UiDirectionCommandControl_t direction_control = {
+      .waiting_for_result = false,
+      .protection_active = false,
+      .pending_token = 0U,
+      .pending_motor_mask = 0U,
+      .pending_direction = MOTOR_DIRECTION_NORMAL,
+      .next_token = 1U,
+      .protection_deadline_tick = 0U
+  };
+
+  //定义 一个Ui事件消息结构体 变量
+  UiEventMessage_t event_message;
   uint32_t refresh_start_tick;
   uint32_t refresh_duration;
 
@@ -367,31 +439,57 @@ void StartUiTask(void *argument)
      * 想想是怎么把数据传向 event 这个结构体的
      * 
      * 没有按键动作时永久阻塞，任务不占用CPU时间。InputTask写入一条
-     * UiInputEvent_t后本任务被唤醒；只有状态真的改变才刷新屏幕。
+     * UiEventMessage_t后本任务被唤醒。按键事件只有在状态真的改变时才
+     * 刷新屏幕；CAN结果事件只更新命令控制状态并触发成功反馈。
      * 
      * osWaitForever 是
      */
     if (osMessageQueueGet(UiEventQueueHandle,
-                          &event,
+                          &event_message,
                           NULL,
                           osWaitForever) == osOK)
     {
-      const MotorDirectionUiView_t previous_view = view;
-
-      if (UiTask_HandleInputEvent(&view, &event))
+      if (event_message.message_type == UI_EVENT_MESSAGE_INPUT)
       {
-        /*
-         * 按键动作后只重画旧焦点、新焦点以及可能变化的开关区域，避免
-         * 每次操作都重新发送完整屏幕的57,600字节。
+        const MotorDirectionUiView_t previous_view = view;
+
+        /**
+         * event_message.data.input 和 view 一起决定要做什么，比如保存转向指令消息到Can队列中
+         * 
+         * direction_control是用来保存这个转向修改指令的状态的，比如是不是已经进入libcanard消息队列，是否处于2秒保护状态
          */
-        refresh_start_tick = osKernelGetTickCount();
-        MotorDirectionUI_Update(&previous_view, &view);
-        refresh_duration = osKernelGetTickCount() - refresh_start_tick;
-        g_ui_last_refresh_time_ms = refresh_duration;
-        if (refresh_duration > g_ui_max_refresh_time_ms)
+
+        if (UiTask_HandleInputEvent(&view,
+                                    &direction_control,
+                                    &event_message.data.input))
         {
-          g_ui_max_refresh_time_ms = refresh_duration;
+          /*
+           * 按键动作后只重画旧焦点、新焦点以及可能变化的开关区域，避免
+           * 每次操作都重新发送完整屏幕的57,600字节。
+           */
+          refresh_start_tick = osKernelGetTickCount();
+          MotorDirectionUI_Update(&previous_view, &view);
+          refresh_duration = osKernelGetTickCount() - refresh_start_tick;
+          g_ui_last_refresh_time_ms = refresh_duration;
+          if (refresh_duration > g_ui_max_refresh_time_ms)
+          {
+            g_ui_max_refresh_time_ms = refresh_duration;
+          }
         }
+      }
+      else if (event_message.message_type ==
+               UI_EVENT_MESSAGE_CAN_COMMAND_RESULT)
+      {
+        /**
+         * direction_control 这个参数在函数中根据情况在赋值
+         */
+        UiTask_HandleCanCommandResult(
+            &direction_control,
+            &event_message.data.can_command_result);
+      }
+      else
+      {
+        /* 防御损坏或版本不匹配的队列消息，不访问union中的无效成员。 */
       }
     }
   }
@@ -410,6 +508,7 @@ void StartCanTask(void *argument)
   /* USER CODE BEGIN StartCanTask */
   HAL_StatusTypeDef status = HAL_OK;
   CanCommand_t command;
+  CanCommandResult_t command_result;
 
   (void)argument;
 
@@ -436,7 +535,8 @@ void StartCanTask(void *argument)
                           NULL,                    // 不需要读取消息优先级
                           0U) == osOK)              // 队列为空时不等待
     {
-      CanTask_HandleCommand(&command);
+      CanTask_HandleCommand(&command, &command_result);
+      CanTask_PostCommandResult(&command_result);
     }
 
     status = DroneCAN_ProcessTx();
@@ -551,21 +651,28 @@ void StartInputTask(void *argument)
  */
 static void InputTask_PostUiEvent(const KeyEvent_t *key_event)
 {
-  UiInputEvent_t ui_event;
+  UiEventMessage_t event_message;
+  UiInputEvent_t *ui_event;
 
   if (key_event == NULL)
   {
     return;
   }
 
-  ui_event.key_id = key_event->key_id;
+  event_message.message_type = UI_EVENT_MESSAGE_INPUT;
+
+  /**
+   * 这里就是把event_message.data.input的地址给到了ui_event，ui_event它后面的赋值就是给到了event_message.data.input
+   */
+  ui_event = &event_message.data.input;
+  ui_event->key_id = key_event->key_id;
   if (key_event->event_type == KEY_EVENT_SHORT_PRESS)
   {
-    ui_event.action = UI_INPUT_ACTION_SHORT_PRESS;
+    ui_event->action = UI_INPUT_ACTION_SHORT_PRESS;
   }
   else if (key_event->event_type == KEY_EVENT_LONG_PRESS)
   {
-    ui_event.action = UI_INPUT_ACTION_LONG_PRESS;
+    ui_event->action = UI_INPUT_ACTION_LONG_PRESS;
   }
   else
   {
@@ -573,7 +680,7 @@ static void InputTask_PostUiEvent(const KeyEvent_t *key_event)
   }
 
   if (osMessageQueuePut(UiEventQueueHandle,
-                        &ui_event,
+                        &event_message,
                         0U,
                         0U) == osOK)
   {
@@ -588,16 +695,18 @@ static void InputTask_PostUiEvent(const KeyEvent_t *key_event)
 /**
  * @brief 根据一条短按/长按事件推进电机方向页面状态机。
  * @param[in,out] view  当前视图状态；发生有效操作时在原结构体上修改。
+ * @param[in,out] control 方向命令的等待结果及2秒保护状态。
  * @param[in] event     InputTask通过队列提交的一条完整输入事件。
  * @return true表示界面内容或焦点发生变化，需要重绘；false表示忽略事件。
  *
- * 当前阶段只完成UI，不调用CanCommandQueue或任何DroneCAN函数。方向层长按
- * Confirm仅累计调试计数，下一阶段再从这里提交明确的电机通道和方向命令。
+ * UiTask只向CanCommandQueue提交明确的通道和目标方向，不直接调用DroneCAN
+ * 或libcanard。真正的协议封装与发送仍由CanTask独占完成。
  */
 static bool UiTask_HandleInputEvent(MotorDirectionUiView_t *view,
+                                    UiDirectionCommandControl_t *control,
                                     const UiInputEvent_t *event)
 {
-  if ((view == NULL) || (event == NULL) ||
+  if ((view == NULL) || (control == NULL) || (event == NULL) ||
       ((uint32_t)event->key_id >= (uint32_t)KEY_ID_COUNT))
   {
     return false;
@@ -609,10 +718,12 @@ static bool UiTask_HandleInputEvent(MotorDirectionUiView_t *view,
     if ((view->focus == MOTOR_DIRECTION_UI_FOCUS_DIRECTION) &&
         (event->key_id == KEY_ID_CONFIRM))
     {
-      /* 已识别发送手势；本阶段明确不发送CAN，仅供调试器确认。 */
+      /*
+       * 只有方向选择层的Confirm长按才是危险操作确认手势。提交成功不
+       * 立即闪灯鸣叫；必须等待CanTask返回“已加入libcanard队列”。
+       */
       g_ui_direction_long_confirm_count++;
-      DirectionLedFeedback_Start();
-      DirectionBuzzFeedback();
+      (void)UiTask_SubmitDirectionCommand(view, control);
     }
     return false;
   }
@@ -713,6 +824,162 @@ static bool UiTask_HandleInputEvent(MotorDirectionUiView_t *view,
 }
 
 /**
+ * @brief 检查方向命令的2秒重复发送保护是否仍然有效。
+ *
+ * 使用有符号Tick差值判断截止时间，可正确处理32位Tick自然回绕。保护
+ * 到期时同时清除可能因结果事件丢失而遗留的waiting_for_result，避免UI
+ * 永久锁死；在这2秒内仍不会再次发送，符合接收板执行时序的安全要求。
+ * 
+ * UiTask_DirectionCommandIsProtected 的true表示 当前禁止再次发送方向修改指令，false 表示可以发送新的方向修改命令
+ */
+static bool UiTask_DirectionCommandIsProtected(
+    UiDirectionCommandControl_t *control)
+{
+  const uint32_t now_tick = osKernelGetTickCount();
+
+  if (control == NULL)
+  {
+    return true;
+  }
+
+  if (!control->protection_active)
+  {
+    return false;
+  }
+
+  if ((int32_t)(now_tick - control->protection_deadline_tick) < 0)
+  {
+    return true;
+  }
+
+  control->protection_active = false;
+  control->waiting_for_result = false;
+  control->pending_token = 0U;
+  control->pending_motor_mask = 0U;
+  return false;
+}
+
+/**
+ * @brief 把当前UI选择转换为一条明确的方向命令并交给CanTask。
+ * @return true表示完整命令已复制进CanCommandQueue；false表示未提交。
+ *
+ * motor_mask的bit0~bit7分别对应1~8通道。这里发送的是SET_NORMAL或
+ * SET_REVERSED目标状态，而不是不确定当前状态的“toggle”。队列使用0超时，
+ * UiTask不会因为CanTask异常而阻塞；队列满时本次操作明确失败且不反馈成功。
+ */
+static bool UiTask_SubmitDirectionCommand(
+    const MotorDirectionUiView_t *view,
+    UiDirectionCommandControl_t *control)
+{
+  CanCommand_t command;
+  const uint32_t now_tick = osKernelGetTickCount();
+
+  if ((view == NULL) || (control == NULL) ||
+      (view->power_state != MOTOR_DIRECTION_UI_POWER_ON) ||
+      (view->focus != MOTOR_DIRECTION_UI_FOCUS_DIRECTION) ||
+      (view->selected_motor < 1U) || (view->selected_motor > 8U))
+  {
+    return false;
+  }
+
+  if (UiTask_DirectionCommandIsProtected(control))
+  {
+    g_ui_direction_command_protected_count++;
+    return false;
+  }
+
+  /**
+   * control->next_token 是代表什么？
+   * view->selected_motor - 1U 是什么意思
+   * 
+   * 1UL << (view->selected_motor - 1U) 是代表 1 向左移多少位
+   */
+  command.command_type = CAN_COMMAND_SET_DIRECTION;
+  command.request_token = control->next_token;
+  command.motor_mask = (uint8_t)(1UL << (view->selected_motor - 1U));
+  command.direction = (view->selected_direction == MOTOR_DIRECTION_UI_REVERSED)
+                          ? MOTOR_DIRECTION_REVERSED
+                          : MOTOR_DIRECTION_NORMAL;
+
+  if (osMessageQueuePut(CanCommandQueueHandle,
+                        &command,
+                        0U,
+                        0U) != osOK)
+  {
+    g_ui_direction_command_queue_full_count++;
+    return false;
+  }
+
+  /*
+   * 从命令成功交给CanTask的时刻就开始2秒保护。这样即使结果事件意外
+   * 丢失，也不会在接收板可能仍忙碌时立即发送第二条方向命令。
+   */
+  control->waiting_for_result = true;
+  control->protection_active = true;
+  control->pending_token = command.request_token;
+  control->pending_motor_mask = command.motor_mask;
+  control->pending_direction = command.direction;
+  control->protection_deadline_tick =
+      now_tick + (uint32_t)pdMS_TO_TICKS(
+                         DIRECTION_COMMAND_PROTECTION_TIME_MS);
+
+  control->next_token++;
+  if (control->next_token == 0U)
+  {
+    /* 0保留给初始化/无效状态，16位自然回绕后从1继续。 */
+    control->next_token = 1U;
+  }
+
+  g_ui_direction_command_submitted_count++;
+  return true;
+}
+
+/**
+ * @brief 处理CanTask返回的方向命令本地受理结果。
+ *
+ * 只有关联号、命令类型、通道掩码和方向全部匹配当前等待项，结果才有效。
+ * 成功反馈在此处启动，因此蜂鸣和LED表示“CanTask/libcanard已受理”，而
+ * 不是仅仅表示按键长按被识别。拒绝时立即解除保护，允许用户修正后重试。
+ */
+static void UiTask_HandleCanCommandResult(
+    UiDirectionCommandControl_t *control,
+    const CanCommandResult_t *result)
+{
+  if ((control == NULL) || (result == NULL))
+  {
+    return;
+  }
+
+  if ((!control->waiting_for_result) ||
+      (result->request_token != control->pending_token) ||
+      (result->command_type != CAN_COMMAND_SET_DIRECTION) ||
+      (result->motor_mask != control->pending_motor_mask) ||
+      (result->direction != control->pending_direction))
+  {
+    g_ui_direction_command_stale_result_count++;
+    return;
+  }
+
+  control->waiting_for_result = false;
+
+  if ((result->status == CAN_COMMAND_RESULT_ACCEPTED) &&
+      (result->transport_result > 0))
+  {
+    /* 保护截止时间保持不变，成功反馈不延长2秒执行窗口。 */
+    g_ui_direction_command_accepted_count++;
+    DirectionLedFeedback_Start();
+    DirectionBuzzFeedback();
+    return;
+  }
+
+  /* 未成功加入libcanard队列，不存在接收板忙碌风险，可立即重试。 */
+  control->protection_active = false;
+  control->pending_token = 0U;
+  control->pending_motor_mask = 0U;
+  g_ui_direction_command_rejected_count++;
+}
+
+/**
  * @brief 启动或重新启动方向LED快速闪烁3次的非阻塞反馈。
  *
  * 本函数只立即点亮LED并启动FreeRTOS软件定时器，随后马上返回。UiTask
@@ -798,10 +1065,10 @@ static void DirectionLedTimerCallback(void *argument)
 
 
 /**
- * 这是方向确认后的声音反馈函数，启动一次性定时器，100 ms后自动熄灭蜂鸣器。
- * 
- * DirectionBuzzFeedback()就是给函数调用的，osTimerStart用来启动一次。
- * DirectionBuzzTimerCallback()是 FreeRtos内部每隔100ms调用，所以100ms以后我就osTimerStop停止这个任务
+ * @brief 启动方向命令受理后的非阻塞蜂鸣反馈。
+ *
+ * 本函数只打开蜂鸣器并启动一次性软件定时器，随后立即返回。定时器到期
+ * 后只调用一次DirectionBuzzTimerCallback关闭蜂鸣器，不会阻塞UiTask。
  */
 static void DirectionBuzzFeedback(void)
 {
@@ -820,7 +1087,7 @@ static void DirectionBuzzFeedback(void)
                       Buzz_Pin,
                       GPIO_PIN_SET);
 
-  /* 启动一次性定时器，100 ms后自动熄灭蜂鸣器。 */
+  /* 启动一次性定时器，达到配置的400 ms后自动熄灭蜂鸣器。 */
   if (osTimerStart(
           DirectionBuzzTimerHandle,
           pdMS_TO_TICKS(DIRECTION_BUZZ_DURATION_MS)) != osOK)
@@ -846,11 +1113,7 @@ static void DirectionBuzzTimerCallback(void *argument)
                     Buzz_Pin,
                     GPIO_PIN_RESET);
 
-  /***
-   * 
-   *一次性定时器无需手动停止
-   *  100 ms后自动熄灭蜂鸣器。*/
-  // (void)osTimerStop(DirectionBuzzTimerHandle);
+  /* osTimerOnce到期后自动停止，不需要在回调内再次调用osTimerStop。 */
 }
 
 
@@ -861,9 +1124,30 @@ static void DirectionBuzzTimerCallback(void *argument)
  * Transfer-ID、request_id和libcanard发送队列始终只有一个任务访问，
  * 因而不需要为libcanard再添加互斥锁。
  */
-static void CanTask_HandleCommand(const CanCommand_t *command)
+static void CanTask_HandleCommand(const CanCommand_t *command,
+                                  CanCommandResult_t *result)
 {
-  int16_t result;
+  int16_t transport_result;
+
+  if (result == NULL)
+  {
+    return;
+  }
+
+  /*
+   * 先构造一份完整的默认拒绝结果，确保任何提前返回路径都能通知UiTask，
+   * 不会让UI一直停留在“等待CanTask结果”的状态。
+   */
+  result->request_token = (command != NULL) ? command->request_token : 0U;
+  result->command_type = (command != NULL)
+                             ? command->command_type
+                             : CAN_COMMAND_SET_DIRECTION;
+  result->motor_mask = (command != NULL) ? command->motor_mask : 0U;
+  result->direction = (command != NULL)
+                          ? command->direction
+                          : MOTOR_DIRECTION_NORMAL;
+  result->status = CAN_COMMAND_RESULT_REJECTED;
+  result->transport_result = 0;
 
   if ((command == NULL) ||
       (command->command_type != CAN_COMMAND_SET_DIRECTION) ||
@@ -875,11 +1159,11 @@ static void CanTask_HandleCommand(const CanCommand_t *command)
 
   if (command->direction == MOTOR_DIRECTION_NORMAL)
   {
-    result = DroneCAN_SetMotorsNormal(command->motor_mask);
+    transport_result = DroneCAN_SetMotorsNormal(command->motor_mask);
   }
   else if (command->direction == MOTOR_DIRECTION_REVERSED)
   {
-    result = DroneCAN_SetMotorsReversed(command->motor_mask);
+    transport_result = DroneCAN_SetMotorsReversed(command->motor_mask);
   }
   else
   {
@@ -891,15 +1175,45 @@ static void CanTask_HandleCommand(const CanCommand_t *command)
    * DirectionCommand为7字节单帧消息，正常情况下result应为1，表示成功
    * 加入一个libcanard软件队列帧；真正装入CAN邮箱由ProcessTx完成。
    */
-  g_last_direction_enqueue_result = result;
+  result->transport_result = transport_result;
+  g_last_direction_enqueue_result = transport_result;
 
-  if (result > 0)
+  if (transport_result > 0)
   {
+    result->status = CAN_COMMAND_RESULT_ACCEPTED;
     g_can_command_accepted_count++;
   }
   else
   {
     g_can_command_rejected_count++;
+  }
+}
+
+/**
+ * @brief 把CanTask处理结果非阻塞地交回UiTask。
+ *
+ * 结果和按键共用UiEventQueue，但通过message_type区分。CanTask不能为了UI
+ * 反馈等待队列空间，否则会停止搬运libcanard发送帧；极端队列满时记录错误，
+ * UiTask仍会依靠2秒保护超时自动解除等待，不会永久锁死。
+ */
+static void CanTask_PostCommandResult(const CanCommandResult_t *result)
+{
+  UiEventMessage_t event_message;
+
+  if (result == NULL)
+  {
+    return;
+  }
+
+  event_message.message_type = UI_EVENT_MESSAGE_CAN_COMMAND_RESULT;
+  event_message.data.can_command_result = *result;
+
+  if (osMessageQueuePut(UiEventQueueHandle,
+                        &event_message,
+                        0U,
+                        0U) != osOK)
+  {
+    g_can_result_event_queue_full_count++;
   }
 }
 

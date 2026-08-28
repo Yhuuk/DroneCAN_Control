@@ -1,6 +1,7 @@
 #ifndef UI_INPUT_EVENT_H
 #define UI_INPUT_EVENT_H
 
+#include "app_messages.h"
 #include "key_input.h"
 
 /**
@@ -29,5 +30,36 @@ typedef struct
     /** 已经由按键层判定完成的短按或长按。 */
     UiInputAction_t action;
 } UiInputEvent_t;
+
+/**
+ * @brief UiEventQueue中消息的种类。
+ *
+ * 同一个队列既可接收InputTask产生的按键动作，也可接收CanTask返回的
+ * 命令处理结果。所有UI业务仍由UiTask串行处理，因此不需要共享状态或
+ * 额外互斥锁。
+ * 
+ * UiEventMessageType_t UI事件消息类型
+ */
+typedef enum
+{
+    UI_EVENT_MESSAGE_INPUT = 0,
+    UI_EVENT_MESSAGE_CAN_COMMAND_RESULT
+} UiEventMessageType_t;
+
+/** @brief 交给UiTask处理的一条带类型消息。
+ * 
+ * 
+ * union 是联合体，两个数据类型共享一个内存地址，一次只能一种类型
+ */
+typedef struct
+{
+    UiEventMessageType_t message_type;
+
+    union
+    {
+        UiInputEvent_t input;
+        CanCommandResult_t can_command_result;
+    } data;
+} UiEventMessage_t;
 
 #endif /* UI_INPUT_EVENT_H */
