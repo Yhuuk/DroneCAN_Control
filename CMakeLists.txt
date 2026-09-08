@@ -57,6 +57,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 
     # DroneCAN DSDL生成代码
     third_party/dronecan_custom_dsdl/dronecan_dsdl_generated/src/dronecan_dshot.DirectionCommand.c
+    third_party/dronecan_custom_dsdl/dronecan_dsdl_generated/src/dronecan_dshot.DirectionQuery_req.c
+    third_party/dronecan_custom_dsdl/dronecan_dsdl_generated/src/dronecan_dshot.DirectionQuery_res.c
     third_party/dronecan_custom_dsdl/dronecan_dsdl_generated/src/uavcan.equipment.esc.RawCommand.c
   
 )

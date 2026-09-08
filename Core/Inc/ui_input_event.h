@@ -43,7 +43,11 @@ typedef struct
 typedef enum
 {
     UI_EVENT_MESSAGE_INPUT = 0,
-    UI_EVENT_MESSAGE_CAN_COMMAND_RESULT
+    UI_EVENT_MESSAGE_CAN_COMMAND_RESULT,
+    UI_EVENT_MESSAGE_DIRECTION_QUERY,
+    /** 方向命令2秒保护期结束，通知UiTask自动查询刚修改的通道。 */
+    UI_EVENT_MESSAGE_DIRECTION_AUTO_QUERY_DUE,
+    UI_EVENT_MESSAGE_DIRECTION_QUERY_ANIMATION_TICK
 } UiEventMessageType_t;
 
 /** @brief 交给UiTask处理的一条带类型消息。
@@ -59,6 +63,7 @@ typedef struct
     {
         UiInputEvent_t input;
         CanCommandResult_t can_command_result;
+        DirectionQueryEvent_t direction_query;
     } data;
 } UiEventMessage_t;
 

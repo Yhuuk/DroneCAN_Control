@@ -28,6 +28,25 @@
 #define UI_MAIN_TRIANGLE_HEIGHT        17U
 #define UI_MAIN_TRIANGLE_HALF_WIDTH    10U
 
+/*
+ * 顶部方向查询动画区和NOR/REV图例布局。三个圆点由UiTask提供动画阶段，
+ * 本绘图模块只负责按视图状态显示，不直接执行查询或按键业务。
+ */
+#define UI_DIRECTION_DOT_COUNT           3U
+#define UI_DIRECTION_DOT_FIRST_X        62U
+#define UI_DIRECTION_DOT_CENTER_Y       12U
+#define UI_DIRECTION_DOT_PITCH          11U
+#define UI_DIRECTION_DOT_RADIUS          3U
+#define UI_DIRECTION_DOT_FOCUS_CENTER_X 73U
+#define UI_DIRECTION_DOT_FOCUS_CENTER_Y 12U
+#define UI_DIRECTION_DOT_FOCUS_RADIUS_X 20U
+#define UI_DIRECTION_DOT_FOCUS_RADIUS_Y 10U
+#define UI_LEGEND_NOR_TRIANGLE_X       113U
+#define UI_LEGEND_NOR_TEXT_X           126U
+#define UI_LEGEND_SEPARATOR_LEFT_X     164U
+#define UI_LEGEND_REV_TRIANGLE_X       182U
+#define UI_LEGEND_REV_TEXT_X           196U
+
 /* 页面使用的RGB565颜色。 */
 #define UI_COLOR_BACKGROUND          BLACK
 /*
@@ -42,12 +61,16 @@
  * 色觉来分辨焦点层级。
  */
 #define UI_COLOR_FOCUS_SWITCH        0xFDC0U
+#define UI_COLOR_FOCUS_STATUS_DOTS   UI_COLOR_FOCUS_SWITCH
 #define UI_COLOR_FOCUS_MOTOR         WHITE
 #define UI_COLOR_FOCUS_DIRECTION     0x07F5U
 #define UI_COLOR_STATUS_BACKGROUND   LGRAY
 #define UI_COLOR_STATUS_OFF          RED
 #define UI_COLOR_STATUS_ON           GREEN
 #define UI_COLOR_NUMBER              CYAN
+#define UI_COLOR_DIRECTION_DOT       CYAN
+#define UI_COLOR_DIRECTION_DOT_DIM   0x2124U
+#define UI_COLOR_DIRECTION_VERIFIED  0x07F0U
 #define UI_COLOR_UP                   MAGENTA
 #define UI_COLOR_DOWN                 0xD81FU
 #define UI_COLOR_SEPARATOR            GRAYBLUE
@@ -69,7 +92,11 @@ static const MotorDirectionUiView_t g_safe_default_view = {
     .power_state = MOTOR_DIRECTION_UI_POWER_OFF,
     .focus = MOTOR_DIRECTION_UI_FOCUS_SWITCH,
     .selected_motor = 1U,
-    .selected_direction = MOTOR_DIRECTION_UI_NORMAL
+    .selected_direction = MOTOR_DIRECTION_UI_NORMAL,
+    .direction_query_in_progress = false,
+    .query_animation_dot_count = UI_DIRECTION_DOT_COUNT,
+    .queried_direction_valid_mask = 0U,
+    .queried_direction_reversed_mask = 0U
 };
 
 #if (LCD_W != 120U) || (LCD_H != 240U)
@@ -116,6 +143,59 @@ static bool MotorDirectionUI_PointInCircle(uint16_t x,
     const int32_t radius_squared = (int32_t)radius * (int32_t)radius;
 
     return ((dx * dx) + (dy * dy)) <= radius_squared;
+}
+
+/**
+ * @brief 判断一个点是否位于椭圆内部。
+ *
+ * 使用交叉相乘的整数形式代替浮点除法：
+ * dx²/rx² + dy²/ry² <= 1。当前坐标和半径很小，int32_t足以容纳中间值。
+ */
+static bool MotorDirectionUI_PointInEllipse(uint16_t x,
+                                            uint16_t y,
+                                            uint16_t center_x,
+                                            uint16_t center_y,
+                                            uint16_t radius_x,
+                                            uint16_t radius_y)
+{
+    const int32_t dx = (int32_t)x - (int32_t)center_x;
+    const int32_t dy = (int32_t)y - (int32_t)center_y;
+    const int32_t radius_x_squared =
+        (int32_t)radius_x * (int32_t)radius_x;
+    const int32_t radius_y_squared =
+        (int32_t)radius_y * (int32_t)radius_y;
+
+    if ((radius_x == 0U) || (radius_y == 0U))
+    {
+        return false;
+    }
+
+    return ((dx * dx * radius_y_squared) +
+            (dy * dy * radius_x_squared)) <=
+           (radius_x_squared * radius_y_squared);
+}
+
+/** @brief 判断点是否位于1像素厚的椭圆焦点轮廓上。 */
+static bool MotorDirectionUI_PointOnEllipseBorder(uint16_t x,
+                                                  uint16_t y,
+                                                  uint16_t center_x,
+                                                  uint16_t center_y,
+                                                  uint16_t radius_x,
+                                                  uint16_t radius_y)
+{
+    if (!MotorDirectionUI_PointInEllipse(
+            x, y, center_x, center_y, radius_x, radius_y))
+    {
+        return false;
+    }
+
+    if ((radius_x < 2U) || (radius_y < 2U))
+    {
+        return true;
+    }
+
+    return !MotorDirectionUI_PointInEllipse(
+        x, y, center_x, center_y, radius_x - 1U, radius_y - 1U);
 }
 
 /**
@@ -264,6 +344,7 @@ static uint16_t MotorDirectionUI_GetLogicalPixel(
     const MotorDirectionUiView_t *view)
 {
     uint16_t color = UI_COLOR_BACKGROUND;
+    uint8_t direction_dot_index;
     uint8_t motor_index;
 
     /* 顶部与主体使用统一蓝灰色边框，形成分区但不抢占状态色和焦点色。 */
@@ -326,30 +407,79 @@ static uint16_t MotorDirectionUI_GetLogicalPixel(
         color = UI_COLOR_FOCUS_SWITCH;
     }
 
-    /* 顶部图例：上三角=NOR，下三角=REV，中间竖线用于视觉分隔。 */
+    /*
+     * 开关右侧三个圆点显示方向查询进度。空闲时三点均为青色；查询时
+     * 按1→2→3循环点亮，尚未到达的点使用低亮蓝灰色。
+     */
+    for (direction_dot_index = 0U;
+         direction_dot_index < UI_DIRECTION_DOT_COUNT;
+         ++direction_dot_index)
+    {
+        const uint16_t center_x =
+            UI_DIRECTION_DOT_FIRST_X +
+            ((uint16_t)direction_dot_index * UI_DIRECTION_DOT_PITCH);
+
+        if (MotorDirectionUI_PointInCircle(
+                x, y, center_x, UI_DIRECTION_DOT_CENTER_Y,
+                UI_DIRECTION_DOT_RADIUS))
+        {
+            const bool dot_is_lit =
+                (!view->direction_query_in_progress) ||
+                (direction_dot_index < view->query_animation_dot_count);
+
+            color = dot_is_lit
+                        ? UI_COLOR_DIRECTION_DOT
+                        : UI_COLOR_DIRECTION_DOT_DIM;
+        }
+    }
+
+    /*
+     * 三个点在业务上作为一个顶栏选项，因此只绘制一个共同的椭圆焦点，
+     * 不分别包围单个圆点。它沿用开关焦点的暖黄色，表示相同菜单层级。
+     */
+    if ((view->focus == MOTOR_DIRECTION_UI_FOCUS_STATUS_DOTS) &&
+        MotorDirectionUI_PointOnEllipseBorder(
+            x, y,
+            UI_DIRECTION_DOT_FOCUS_CENTER_X,
+            UI_DIRECTION_DOT_FOCUS_CENTER_Y,
+            UI_DIRECTION_DOT_FOCUS_RADIUS_X,
+            UI_DIRECTION_DOT_FOCUS_RADIUS_Y))
+    {
+        color = UI_COLOR_FOCUS_STATUS_DOTS;
+    }
+
+    /*
+     * 顶部图例：上三角=NOR，下三角=REV，中间竖线用于视觉分隔。
+     * 两组图例向右重新排布，为三个圆点留出均匀且不拥挤的间距。
+     */
     if (MotorDirectionUI_PointInTriangle(
-            x, y, 95U, 6U, 16U, 10U, true))
+            x, y, UI_LEGEND_NOR_TRIANGLE_X, 6U, 16U, 10U, true))
     {
         color = UI_COLOR_UP;
     }
 
-    if (MotorDirectionUI_TextPixel(x, y, 109U, 5U, "NOR"))
+    if (MotorDirectionUI_TextPixel(
+            x, y, UI_LEGEND_NOR_TEXT_X, 5U, "NOR"))
     {
         color = UI_COLOR_UP;
     }
 
-    if (MotorDirectionUI_PointInRectangle(x, y, 154U, 3U, 155U, 27U))
+    if (MotorDirectionUI_PointInRectangle(
+            x, y,
+            UI_LEGEND_SEPARATOR_LEFT_X, 3U,
+            UI_LEGEND_SEPARATOR_LEFT_X + 1U, 27U))
     {
         color = UI_COLOR_SEPARATOR;
     }
 
     if (MotorDirectionUI_PointInTriangle(
-            x, y, 174U, 6U, 16U, 10U, false))
+            x, y, UI_LEGEND_REV_TRIANGLE_X, 6U, 16U, 10U, false))
     {
         color = UI_COLOR_DOWN;
     }
 
-    if (MotorDirectionUI_TextPixel(x, y, 188U, 5U, "REV"))
+    if (MotorDirectionUI_TextPixel(
+            x, y, UI_LEGEND_REV_TEXT_X, 5U, "REV"))
     {
         color = UI_COLOR_DOWN;
     }
@@ -363,6 +493,26 @@ static uint16_t MotorDirectionUI_GetLogicalPixel(
             (char)((uint8_t)'1' + motor_index),
             '\0'
         };
+        const uint8_t motor_bit = (uint8_t)(1U << motor_index);
+        uint16_t up_triangle_color = UI_COLOR_UP;
+        uint16_t down_triangle_color = UI_COLOR_DOWN;
+
+        /*
+         * 只有最近一次完整查询中valid=1的通道才显示绿色。valid且
+         * reversed=0表示NOR；valid且reversed=1表示REV。未知/失败通道
+         * 维持原紫色，绝不把“没有结果”误显示成Normal。
+         */
+        if ((view->queried_direction_valid_mask & motor_bit) != 0U)
+        {
+            if ((view->queried_direction_reversed_mask & motor_bit) != 0U)
+            {
+                down_triangle_color = UI_COLOR_DIRECTION_VERIFIED;
+            }
+            else
+            {
+                up_triangle_color = UI_COLOR_DIRECTION_VERIFIED;
+            }
+        }
 
         /* 通道焦点使用柔白色19x19方框，与青色编号和蓝灰外框区分。 */
         if ((view->focus == MOTOR_DIRECTION_UI_FOCUS_MOTOR) &&
@@ -383,14 +533,14 @@ static uint16_t MotorDirectionUI_GetLogicalPixel(
                 x, y, center_x, UI_MAIN_UP_TRIANGLE_TOP_Y,
                 UI_MAIN_TRIANGLE_HEIGHT, UI_MAIN_TRIANGLE_HALF_WIDTH, true))
         {
-            color = UI_COLOR_UP;
+            color = up_triangle_color;
         }
 
         if (MotorDirectionUI_PointInTriangle(
                 x, y, center_x, UI_MAIN_DOWN_TRIANGLE_TOP_Y,
                 UI_MAIN_TRIANGLE_HEIGHT, UI_MAIN_TRIANGLE_HALF_WIDTH, false))
         {
-            color = UI_COLOR_DOWN;
+            color = down_triangle_color;
         }
 
         /*
@@ -439,6 +589,7 @@ static void MotorDirectionUI_ValidateView(
         destination->power_state = MOTOR_DIRECTION_UI_POWER_OFF;
     }
     if ((destination->focus != MOTOR_DIRECTION_UI_FOCUS_SWITCH) &&
+        (destination->focus != MOTOR_DIRECTION_UI_FOCUS_STATUS_DOTS) &&
         (destination->focus != MOTOR_DIRECTION_UI_FOCUS_MOTOR) &&
         (destination->focus != MOTOR_DIRECTION_UI_FOCUS_DIRECTION))
     {
@@ -454,6 +605,23 @@ static void MotorDirectionUI_ValidateView(
     {
         destination->selected_direction = MOTOR_DIRECTION_UI_NORMAL;
     }
+
+    if (destination->direction_query_in_progress)
+    {
+        if ((destination->query_animation_dot_count < 1U) ||
+            (destination->query_animation_dot_count > UI_DIRECTION_DOT_COUNT))
+        {
+            destination->query_animation_dot_count = 1U;
+        }
+    }
+    else
+    {
+        destination->query_animation_dot_count = UI_DIRECTION_DOT_COUNT;
+    }
+
+    /* REV只允许出现在已经确认有效的通道中。 */
+    destination->queried_direction_reversed_mask &=
+        destination->queried_direction_valid_mask;
 }
 
 /**
@@ -551,6 +719,12 @@ static void MotorDirectionUI_DrawFocusRegion(
         MotorDirectionUI_DrawLogicalRegion(
             current_view, 0U, 0U, 46U, 22U);
     }
+    else if (focus == MOTOR_DIRECTION_UI_FOCUS_STATUS_DOTS)
+    {
+        /* 覆盖椭圆外缘并留1像素擦除余量。 */
+        MotorDirectionUI_DrawLogicalRegion(
+            current_view, 52U, 1U, 94U, 23U);
+    }
     else if (focus == MOTOR_DIRECTION_UI_FOCUS_MOTOR)
     {
         const uint16_t center_x = UI_MOTOR_FIRST_CENTER_X +
@@ -616,6 +790,26 @@ void MotorDirectionUI_Update(const MotorDirectionUiView_t *previous_view,
     {
         MotorDirectionUI_DrawLogicalRegion(
             &current, 0U, 0U, 46U, 22U);
+    }
+
+    if ((previous.direction_query_in_progress !=
+         current.direction_query_in_progress) ||
+        (previous.query_animation_dot_count !=
+         current.query_animation_dot_count))
+    {
+        /* 查询动画仅重画三个点及其椭圆焦点所在的顶栏小区域。 */
+        MotorDirectionUI_DrawLogicalRegion(
+            &current, 52U, 1U, 94U, 23U);
+    }
+
+    if ((previous.queried_direction_valid_mask !=
+         current.queried_direction_valid_mask) ||
+        (previous.queried_direction_reversed_mask !=
+         current.queried_direction_reversed_mask))
+    {
+        /* 最终结果一次性重画8路NOR/REV三角形，不影响通道编号和顶栏。 */
+        MotorDirectionUI_DrawLogicalRegion(
+            &current, 0U, 54U, UI_LOGICAL_WIDTH - 1U, 114U);
     }
 
     if ((previous.focus != current.focus) ||

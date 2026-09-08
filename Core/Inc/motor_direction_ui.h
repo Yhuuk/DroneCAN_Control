@@ -1,6 +1,7 @@
 #ifndef MOTOR_DIRECTION_UI_H
 #define MOTOR_DIRECTION_UI_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -24,6 +25,9 @@ typedef enum
 {
     /** 焦点包围左上角OFF/ON滑动开关。 */
     MOTOR_DIRECTION_UI_FOCUS_SWITCH = 0,
+
+    /** 焦点以一个椭圆整体包围顶栏的三个方向状态点。 */
+    MOTOR_DIRECTION_UI_FOCUS_STATUS_DOTS,
 
     /** 焦点包围当前选中的1~8通道编号。 */
     MOTOR_DIRECTION_UI_FOCUS_MOTOR,
@@ -53,6 +57,18 @@ typedef struct
     MotorDirectionUiFocus_t focus;
     uint8_t selected_motor;
     MotorDirectionUiDirection_t selected_direction;
+
+    /** true时顶栏三个点按1→2→3→1循环显示查询动画。 */
+    bool direction_query_in_progress;
+
+    /** 查询动画当前点亮的点数；有效范围1~3。 */
+    uint8_t query_animation_dot_count;
+
+    /** 最近一次完整查询中方向有效的通道位图。 */
+    uint8_t queried_direction_valid_mask;
+
+    /** 有效通道中方向为REV的位图，必须是valid_mask的子集。 */
+    uint8_t queried_direction_reversed_mask;
 } MotorDirectionUiView_t;
 
 /**

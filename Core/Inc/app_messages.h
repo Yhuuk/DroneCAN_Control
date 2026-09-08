@@ -6,7 +6,10 @@
 /** @brief 由应用输入层提交给CanTask的命令种类。 */
 typedef enum
 {
-    CAN_COMMAND_SET_DIRECTION = 1
+    CAN_COMMAND_SET_DIRECTION = 1,
+
+    /** 启动一次motor_mask指定通道的方向查询服务事务。 */
+    CAN_COMMAND_START_DIRECTION_QUERY
 } CanCommandType_t;
 
 /**
@@ -79,6 +82,46 @@ typedef struct
      */
     int16_t transport_result;
 } CanCommandResult_t;
+
+/** @brief CanTask通知UiTask的方向查询阶段。 */
+typedef enum
+{
+    /** START_QUERY已经得到ACCEPTED/IN_PROGRESS响应，查询仍在运行。 */
+    DIRECTION_QUERY_EVENT_ACTIVE = 0,
+
+    /** 收到并校验通过的STATUS_COMPLETE最终结果。 */
+    DIRECTION_QUERY_EVENT_COMPLETE,
+
+    /** 查询被远端拒绝、响应非法、发送失败或总等待超时。 */
+    DIRECTION_QUERY_EVENT_FAILED
+} DirectionQueryEventType_t;
+
+/* 不与DSDL的1~9状态码冲突的本地失败原因。 */
+#define DIRECTION_QUERY_LOCAL_STATUS_TX_ERROR          0xFDU
+#define DIRECTION_QUERY_LOCAL_STATUS_INVALID_RESPONSE  0xFEU
+#define DIRECTION_QUERY_LOCAL_STATUS_TIMEOUT           0xFFU
+
+/**
+ * @brief CanTask交给UiTask的一条方向查询进度或最终结果。
+ *
+ * response_status保存DirectionQuery DSDL的STATUS_*数值；0xFD~0xFF用于
+ * 本地错误。只有event_type为COMPLETE时，UiTask才把方向位图用于显示。
+ */
+typedef struct
+{
+    uint16_t request_token;
+    uint16_t request_id;
+    DirectionQueryEventType_t event_type;
+    uint8_t response_status;
+    uint8_t query_motor_mask;
+    uint8_t valid_mask;
+    uint8_t reversed_mask;
+    uint8_t timeout_mask;
+    uint8_t crc_error_mask;
+    uint8_t unsupported_mask;
+    uint8_t protocol_error_mask;
+    uint8_t maintenance_error;
+} DirectionQueryEvent_t;
 
 
 

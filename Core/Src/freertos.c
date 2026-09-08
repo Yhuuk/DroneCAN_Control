@@ -27,10 +27,12 @@
 /* USER CODE BEGIN Includes */
 #include "app_messages.h"
 #include "can_port.h"
+#include "dronecan_config.h"
 #include "dronecan_node.h"
 #include "key_input.h"
 #include "motor_direction_ui.h"
 #include "ui_input_event.h"
+#include <dronecan_dshot.DirectionQuery.h>
 
 #include <stdbool.h>
 
@@ -66,7 +68,34 @@ typedef struct
 
   /** 使用RTOS Tick表示的保护截止时刻。 */
   uint32_t protection_deadline_tick;
+
+  /** true表示保护期结束后需要自动查询刚修改通道的实际方向。 */
+  bool auto_query_pending;
+
+  /** 自动查询目标；bit0~bit7分别对应电机1~8。 */
+  uint8_t auto_query_motor_mask;
 } UiDirectionCommandControl_t;
+
+typedef struct
+{
+  bool active;
+  uint16_t pending_token;
+  uint16_t next_token;
+} UiDirectionQueryControl_t;
+
+typedef struct
+{
+  bool active;
+  bool awaiting_response;
+  uint8_t last_operation;
+  uint8_t motor_mask;
+  uint16_t request_token;
+  uint16_t request_id;
+  uint16_t next_request_id;
+  uint32_t response_deadline_tick;
+  uint32_t next_poll_tick;
+  uint32_t overall_deadline_tick;
+} CanDirectionQueryControl_t;
 
 /* USER CODE END PTD */
 
@@ -104,6 +133,18 @@ typedef struct
  */
 #define DIRECTION_COMMAND_PROTECTION_TIME_MS 2000U
 
+/** 查询动画每250 ms多点亮一个圆点，750 ms完成一次1→2→3循环。 */
+#define DIRECTION_QUERY_ANIMATION_PERIOD_MS 250U
+/** ACCEPTED后先避开接收板固定3.5 s准备阶段，再请求最终结果。 */
+#define DIRECTION_QUERY_INITIAL_RESULT_DELAY_MS 4000U
+/** IN_PROGRESS或一次响应丢失后，以500 ms间隔继续查询。 */
+#define DIRECTION_QUERY_POLL_INTERVAL_MS 500U
+/** 单次服务请求等待响应的时间。 */
+#define DIRECTION_QUERY_RESPONSE_TIMEOUT_MS 500U
+/** 包含最坏重试时间的整次查询上限。 */
+#define DIRECTION_QUERY_OVERALL_TIMEOUT_MS 15000U
+#define DIRECTION_QUERY_ALL_MOTORS_MASK 0xFFU
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -139,6 +180,14 @@ osTimerId_t DirectionLedTimerHandle;
  * 这是一次性定时器，用于在确认方向指令时提供声音反馈
  */
 osTimerId_t DirectionBuzzTimerHandle;
+/** 仅产生UI动画Tick，不在定时器回调中直接访问LCD。 */
+osTimerId_t DirectionQueryAnimationTimerHandle;
+
+/**
+ * 方向命令提交后的一次性等待定时器。到期时只通知UiTask开始查询，
+ * 定时器回调本身既不访问LCD，也不直接操作CAN/libcanard。
+ */
+osTimerId_t DirectionAutoQueryTimerHandle;
 
 
 /* 以下变量只用于调试器观察运行情况，不参与控制逻辑。 */
@@ -162,6 +211,7 @@ volatile uint32_t g_can_command_accepted_count;
 volatile uint32_t g_can_command_rejected_count;
 volatile uint32_t g_can_tx_busy_count;
 volatile uint32_t g_can_tx_error_count;
+volatile uint32_t g_can_rx_error_count;
 volatile int16_t g_last_direction_enqueue_result;
 /** UiTask已经成功放入CanCommandQueue的方向命令数量。 */
 volatile uint32_t g_ui_direction_command_submitted_count;
@@ -177,6 +227,26 @@ volatile uint32_t g_ui_direction_command_rejected_count;
 volatile uint32_t g_ui_direction_command_stale_result_count;
 /** CanTask无法把关键命令结果放入UiEventQueue的次数。 */
 volatile uint32_t g_can_result_event_queue_full_count;
+volatile uint32_t g_direction_query_started_count;
+volatile uint32_t g_direction_query_completed_count;
+volatile uint32_t g_direction_query_failed_count;
+volatile uint32_t g_direction_query_poll_count;
+volatile uint32_t g_direction_query_response_timeout_count;
+volatile uint32_t g_direction_query_stale_response_count;
+volatile uint32_t g_direction_query_ui_event_drop_count;
+volatile uint8_t g_last_direction_query_status;
+volatile uint8_t g_last_direction_query_valid_mask;
+volatile uint8_t g_last_direction_query_reversed_mask;
+volatile uint8_t g_last_direction_query_timeout_mask;
+volatile uint8_t g_last_direction_query_crc_error_mask;
+volatile uint8_t g_last_direction_query_unsupported_mask;
+volatile uint8_t g_last_direction_query_protocol_error_mask;
+volatile uint8_t g_last_direction_query_maintenance_error;
+/** 成功安排/启动方向修改后自动单通道查询的次数。 */
+volatile uint32_t g_direction_auto_query_scheduled_count;
+volatile uint32_t g_direction_auto_query_started_count;
+/** 自动查询到期事件因UiEventQueue满而丢失的次数。 */
+volatile uint32_t g_direction_auto_query_event_drop_count;
 
 /* USER CODE END Variables */
 /* Definitions for UiTask */
@@ -207,11 +277,13 @@ const osThreadAttr_t InputTask_attributes = {
 static void InputTask_PostUiEvent(const KeyEvent_t *key_event);
 static bool UiTask_HandleInputEvent(MotorDirectionUiView_t *view,
                                     UiDirectionCommandControl_t *control,
+                                    UiDirectionQueryControl_t *query_control,
                                     const UiInputEvent_t *event);
 static bool UiTask_SubmitDirectionCommand(
     const MotorDirectionUiView_t *view,
     UiDirectionCommandControl_t *control);
-static void UiTask_HandleCanCommandResult(
+static bool UiTask_HandleCanCommandResult(
+    MotorDirectionUiView_t *view,
     UiDirectionCommandControl_t *control,
     const CanCommandResult_t *result);
 static bool UiTask_DirectionCommandIsProtected(
@@ -220,9 +292,31 @@ static void DirectionLedFeedback_Start(void);
 static void DirectionLedTimerCallback(void *argument);
 static void DirectionBuzzTimerCallback(void *argument);
 static void DirectionBuzzFeedback(void);
+static bool UiTask_SubmitDirectionQuery(
+    MotorDirectionUiView_t *view,
+    UiDirectionQueryControl_t *control);
+static bool UiTask_StartDirectionQuery(
+    MotorDirectionUiView_t *view,
+    UiDirectionQueryControl_t *control,
+    uint8_t motor_mask);
+static bool UiTask_HandleDirectionQueryEvent(
+    MotorDirectionUiView_t *view,
+    UiDirectionQueryControl_t *control,
+    const DirectionQueryEvent_t *event);
+static void DirectionQueryAnimationTimerCallback(void *argument);
+static void DirectionAutoQueryTimerCallback(void *argument);
 static void CanTask_HandleCommand(const CanCommand_t *command,
                                   CanCommandResult_t *result);
 static void CanTask_PostCommandResult(const CanCommandResult_t *result);
+static void CanTask_StartDirectionQuery(
+    CanDirectionQueryControl_t *control,
+    const CanCommand_t *command);
+static void CanTask_PollDirectionQuery(CanDirectionQueryControl_t *control);
+static void CanTask_PostDirectionQueryEvent(
+    const CanDirectionQueryControl_t *control,
+    DirectionQueryEventType_t event_type,
+    uint8_t response_status,
+    const DroneCANDirectionQueryResponse_t *response);
 
 /* USER CODE END FunctionPrototypes */
 
@@ -304,6 +398,18 @@ void MX_FREERTOS_Init(void) {
       NULL,
       NULL);
 
+  DirectionQueryAnimationTimerHandle = osTimerNew(
+      DirectionQueryAnimationTimerCallback,
+      osTimerPeriodic,
+      NULL,
+      NULL);
+
+  DirectionAutoQueryTimerHandle = osTimerNew(
+      DirectionAutoQueryTimerCallback,
+      osTimerOnce,
+      NULL,
+      NULL);
+
   if (DirectionLedTimerHandle == NULL)
   {
     /* 软件定时器创建失败通常表示FreeRTOS堆空间不足。 */
@@ -313,6 +419,16 @@ void MX_FREERTOS_Init(void) {
   if(DirectionBuzzTimerHandle == NULL)
   {
     /* 软件定时器创建失败通常表示FreeRTOS堆空间不足。 */
+    Error_Handler();
+  }
+
+  if (DirectionQueryAnimationTimerHandle == NULL)
+  {
+    Error_Handler();
+  }
+
+  if (DirectionAutoQueryTimerHandle == NULL)
+  {
     Error_Handler();
   }
 
@@ -395,7 +511,11 @@ void StartUiTask(void *argument)
       .power_state = MOTOR_DIRECTION_UI_POWER_OFF,
       .focus = MOTOR_DIRECTION_UI_FOCUS_SWITCH,
       .selected_motor = 1U,
-      .selected_direction = MOTOR_DIRECTION_UI_NORMAL
+      .selected_direction = MOTOR_DIRECTION_UI_NORMAL,
+      .direction_query_in_progress = false,
+      .query_animation_dot_count = 3U,
+      .queried_direction_valid_mask = 0U,
+      .queried_direction_reversed_mask = 0U
   };
   UiDirectionCommandControl_t direction_control = {
       .waiting_for_result = false,
@@ -404,7 +524,14 @@ void StartUiTask(void *argument)
       .pending_motor_mask = 0U,
       .pending_direction = MOTOR_DIRECTION_NORMAL,
       .next_token = 1U,
-      .protection_deadline_tick = 0U
+      .protection_deadline_tick = 0U,
+      .auto_query_pending = false,
+      .auto_query_motor_mask = 0U
+  };
+  UiDirectionQueryControl_t query_control = {
+      .active = false,
+      .pending_token = 0U,
+      .next_token = 1U
   };
 
   //定义 一个Ui事件消息结构体 变量
@@ -461,6 +588,7 @@ void StartUiTask(void *argument)
 
         if (UiTask_HandleInputEvent(&view,
                                     &direction_control,
+                                    &query_control,
                                     &event_message.data.input))
         {
           /*
@@ -480,12 +608,69 @@ void StartUiTask(void *argument)
       else if (event_message.message_type ==
                UI_EVENT_MESSAGE_CAN_COMMAND_RESULT)
       {
+        const MotorDirectionUiView_t previous_view = view;
         /**
          * direction_control 这个参数在函数中根据情况在赋值
          */
-        UiTask_HandleCanCommandResult(
+        if (UiTask_HandleCanCommandResult(
+            &view,
             &direction_control,
-            &event_message.data.can_command_result);
+            &event_message.data.can_command_result))
+        {
+          MotorDirectionUI_Update(&previous_view, &view);
+        }
+      }
+      else if (event_message.message_type ==
+               UI_EVENT_MESSAGE_DIRECTION_QUERY)
+      {
+        const MotorDirectionUiView_t previous_view = view;
+
+        if (UiTask_HandleDirectionQueryEvent(
+                &view,
+                &query_control,
+                &event_message.data.direction_query))
+        {
+          MotorDirectionUI_Update(&previous_view, &view);
+        }
+      }
+      else if (event_message.message_type ==
+               UI_EVENT_MESSAGE_DIRECTION_AUTO_QUERY_DUE)
+      {
+        /*
+         * 一次性定时器只负责唤醒UiTask。真正的查询仍由UiTask提交给
+         * CanTask，保证查询状态和LCD状态只在本任务中串行修改。
+         */
+        if (direction_control.auto_query_pending)
+        {
+          const MotorDirectionUiView_t previous_view = view;
+          const uint8_t motor_mask =
+              direction_control.auto_query_motor_mask;
+
+          direction_control.auto_query_pending = false;
+          direction_control.auto_query_motor_mask = 0U;
+
+          if (UiTask_StartDirectionQuery(&view,
+                                         &query_control,
+                                         motor_mask))
+          {
+            g_direction_auto_query_started_count++;
+            MotorDirectionUI_Update(&previous_view, &view);
+          }
+        }
+      }
+      else if (event_message.message_type ==
+               UI_EVENT_MESSAGE_DIRECTION_QUERY_ANIMATION_TICK)
+      {
+        if (query_control.active && view.direction_query_in_progress)
+        {
+          const MotorDirectionUiView_t previous_view = view;
+
+          view.query_animation_dot_count =
+              (view.query_animation_dot_count >= 3U)
+                  ? 1U
+                  : (uint8_t)(view.query_animation_dot_count + 1U);
+          MotorDirectionUI_Update(&previous_view, &view);
+        }
       }
       else
       {
@@ -509,6 +694,18 @@ void StartCanTask(void *argument)
   HAL_StatusTypeDef status = HAL_OK;
   CanCommand_t command;
   CanCommandResult_t command_result;
+  CanDirectionQueryControl_t query_control = {
+      .active = false,
+      .awaiting_response = false,
+      .last_operation = 0U,
+      .motor_mask = 0U,
+      .request_token = 0U,
+      .request_id = 0U,
+      .next_request_id = 1U,
+      .response_deadline_tick = 0U,
+      .next_poll_tick = 0U,
+      .overall_deadline_tick = 0U
+  };
 
   (void)argument;
 
@@ -535,9 +732,24 @@ void StartCanTask(void *argument)
                           NULL,                    // 不需要读取消息优先级
                           0U) == osOK)              // 队列为空时不等待
     {
-      CanTask_HandleCommand(&command, &command_result);
-      CanTask_PostCommandResult(&command_result);
+      if (command.command_type == CAN_COMMAND_START_DIRECTION_QUERY)
+      {
+        CanTask_StartDirectionQuery(&query_control, &command);
+      }
+      else
+      {
+        CanTask_HandleCommand(&command, &command_result);
+        CanTask_PostCommandResult(&command_result);
+      }
     }
+
+    status = DroneCAN_ProcessRx();
+    if (status != HAL_OK)
+    {
+      g_can_rx_error_count++;
+    }
+
+    CanTask_PollDirectionQuery(&query_control);
 
     status = DroneCAN_ProcessTx();
     
@@ -704,9 +916,11 @@ static void InputTask_PostUiEvent(const KeyEvent_t *key_event)
  */
 static bool UiTask_HandleInputEvent(MotorDirectionUiView_t *view,
                                     UiDirectionCommandControl_t *control,
+                                    UiDirectionQueryControl_t *query_control,
                                     const UiInputEvent_t *event)
 {
-  if ((view == NULL) || (control == NULL) || (event == NULL) ||
+  if ((view == NULL) || (control == NULL) || (query_control == NULL) ||
+      (event == NULL) ||
       ((uint32_t)event->key_id >= (uint32_t)KEY_ID_COUNT))
   {
     return false;
@@ -715,6 +929,17 @@ static bool UiTask_HandleInputEvent(MotorDirectionUiView_t *view,
   /* 除方向层长按Confirm外，当前页面的业务全部由短按完成。 */
   if (event->action == UI_INPUT_ACTION_LONG_PRESS)
   {
+    if ((view->focus == MOTOR_DIRECTION_UI_FOCUS_STATUS_DOTS) &&
+        (event->key_id == KEY_ID_CONFIRM))
+    {
+      /* 刚发送过换向命令的2秒保护期内，不启动会占用DShot线的查询。 */
+      if (UiTask_DirectionCommandIsProtected(control))
+      {
+        return false;
+      }
+      return UiTask_SubmitDirectionQuery(view, query_control);
+    }
+
     if ((view->focus == MOTOR_DIRECTION_UI_FOCUS_DIRECTION) &&
         (event->key_id == KEY_ID_CONFIRM))
     {
@@ -736,13 +961,44 @@ static bool UiTask_HandleInputEvent(MotorDirectionUiView_t *view,
   switch (view->focus)
   {
     case MOTOR_DIRECTION_UI_FOCUS_SWITCH:
-      /* OFF时UP/DOWN/BACK均忽略；短按Confirm才进入通道选择。 */
+      /*
+       * OFF顶栏中，UP和DOWN都把焦点切换到三个状态点组成的整体选项。
+       * Confirm仍只负责打开方向功能并直接进入1号通道。
+       */
+      if (((event->key_id == KEY_ID_UP) ||
+           (event->key_id == KEY_ID_DOWN)) &&
+          (view->power_state == MOTOR_DIRECTION_UI_POWER_OFF))
+      {
+        view->focus = MOTOR_DIRECTION_UI_FOCUS_STATUS_DOTS;
+        return true;
+      }
       if (event->key_id == KEY_ID_CONFIRM)
       {
+        /* 查询期间接收板占用DShot维护资源，不允许进入方向修改功能。 */
+        if (query_control->active)
+        {
+          break;
+        }
         view->power_state = MOTOR_DIRECTION_UI_POWER_ON;
         view->focus = MOTOR_DIRECTION_UI_FOCUS_MOTOR;
         view->selected_motor = 1U;
         view->selected_direction = MOTOR_DIRECTION_UI_NORMAL;
+        return true;
+      }
+      break;
+
+    case MOTOR_DIRECTION_UI_FOCUS_STATUS_DOTS:
+      /*
+       * 三个点作为一个顶栏焦点项。UP和DOWN均返回开关；短按Confirm和
+       * Back不响应，长按Confirm已在上方长按分支中启动8路方向查询。
+       *
+       * view->power_state == MOTOR_DIRECTION_UI_POWER_OFF这个条件不添加也是一样，因为当焦点指示器在状态点上时，power_state一定是OFF状态，只有在OFF状态下才会进入这个case
+       */
+      if ((event->key_id == KEY_ID_UP) ||
+           (event->key_id == KEY_ID_DOWN))
+          // (view->power_state == MOTOR_DIRECTION_UI_POWER_OFF))
+      {
+        view->focus = MOTOR_DIRECTION_UI_FOCUS_SWITCH;
         return true;
       }
       break;
@@ -821,6 +1077,191 @@ static bool UiTask_HandleInputEvent(MotorDirectionUiView_t *view,
   }
 
   return false;
+}
+
+/**
+ * @brief 在三点焦点上确认后提交一次8路方向查询。
+ *
+ * 查询命令仍通过CanCommandQueue交给CanTask，UiTask不直接访问libcanard。
+ * 成功入队后立即清除旧方向颜色并启动1→2→3点动画；队列满则保持原界面。
+ */
+static bool UiTask_SubmitDirectionQuery(
+    MotorDirectionUiView_t *view,
+    UiDirectionQueryControl_t *control)
+{
+  if ((view == NULL) || (control == NULL) || control->active ||
+      (view->power_state != MOTOR_DIRECTION_UI_POWER_OFF) ||
+      (view->focus != MOTOR_DIRECTION_UI_FOCUS_STATUS_DOTS))
+  {
+    return false;
+  }
+
+  return UiTask_StartDirectionQuery(view,
+                                    control,
+                                    DIRECTION_QUERY_ALL_MOTORS_MASK);
+}
+
+/**
+ * @brief 启动一次由motor_mask指定通道的方向查询并打开三点动画。
+ *
+ * 手动查询传入0xFF；方向修改后的自动查询只传入刚修改通道对应的一位。
+ * 本函数不限制当前焦点和页面开关状态，以便用户仍停留在方向选择层时也能
+ * 自动验证结果。旧结果仅清除待查通道，其余通道的已验证颜色保持不变。
+ */
+static bool UiTask_StartDirectionQuery(
+    MotorDirectionUiView_t *view,
+    UiDirectionQueryControl_t *control,
+    uint8_t motor_mask)
+{
+  CanCommand_t command;
+
+  if ((view == NULL) || (control == NULL) || control->active ||
+      (motor_mask == 0U))
+  {
+    return false;
+  }
+
+  command.command_type = CAN_COMMAND_START_DIRECTION_QUERY;
+  command.request_token = control->next_token;
+  command.motor_mask = motor_mask;
+  command.direction = MOTOR_DIRECTION_NORMAL; /* 查询命令不使用该字段。 */
+
+  if (osMessageQueuePut(CanCommandQueueHandle,
+                        &command,
+                        0U,
+                        0U) != osOK)
+  {
+    g_ui_direction_command_queue_full_count++;
+    return false;
+  }
+
+  control->active = true;
+  control->pending_token = command.request_token;
+  control->next_token++;
+  if (control->next_token == 0U)
+  {
+    control->next_token = 1U;
+  }
+
+  view->direction_query_in_progress = true;
+  view->query_animation_dot_count = 1U;
+  view->queried_direction_valid_mask &= (uint8_t)~motor_mask;
+  view->queried_direction_reversed_mask &=
+      view->queried_direction_valid_mask;
+
+  if (DirectionQueryAnimationTimerHandle != NULL)
+  {
+    (void)osTimerStop(DirectionQueryAnimationTimerHandle);
+    (void)osTimerStart(
+        DirectionQueryAnimationTimerHandle,
+        pdMS_TO_TICKS(DIRECTION_QUERY_ANIMATION_PERIOD_MS));
+  }
+
+  return true;
+}
+
+/** @brief 把CanTask查询结果应用到UI状态，并停止查询动画。 */
+static bool UiTask_HandleDirectionQueryEvent(
+    MotorDirectionUiView_t *view,
+    UiDirectionQueryControl_t *control,
+    const DirectionQueryEvent_t *event)
+{
+  if ((view == NULL) || (control == NULL) || (event == NULL) ||
+      (!control->active) ||
+      (event->request_token != control->pending_token))
+  {
+    return false;
+  }
+
+  g_last_direction_query_status = event->response_status;
+
+  if (event->event_type == DIRECTION_QUERY_EVENT_ACTIVE)
+  {
+    return false;
+  }
+
+  control->active = false;
+  control->pending_token = 0U;
+  view->direction_query_in_progress = false;
+  view->query_animation_dot_count = 3U;
+
+  if (DirectionQueryAnimationTimerHandle != NULL)
+  {
+    (void)osTimerStop(DirectionQueryAnimationTimerHandle);
+  }
+
+  if (event->event_type == DIRECTION_QUERY_EVENT_COMPLETE)
+  {
+    const uint8_t query_mask = event->query_motor_mask;
+    const uint8_t valid_mask = event->valid_mask & query_mask;
+
+    /*
+     * 单通道自动查询只替换目标通道，不破坏此前已经验证的其它7路结果；
+     * 手动8路查询的query_mask为0xFF，因此仍会整体更新全部通道。
+     */
+    view->queried_direction_valid_mask =
+        (view->queried_direction_valid_mask & (uint8_t)~query_mask) |
+        valid_mask;
+    view->queried_direction_reversed_mask =
+        (view->queried_direction_reversed_mask & (uint8_t)~query_mask) |
+        (event->reversed_mask & valid_mask);
+    g_direction_query_completed_count++;
+  }
+  else
+  {
+    /*
+     * 待查通道在启动查询时已经恢复成未知紫色。查询失败时不再清除其它
+     * 通道，避免一次单通道验证失败破坏此前有效的8路显示结果。
+     */
+    g_direction_query_failed_count++;
+  }
+
+  return true;
+}
+
+/**
+ * @brief 查询动画软件定时器回调。
+ *
+ * 回调只投递一个轻量UI事件，不直接画LCD，保证所有绘图仍由UiTask串行
+ * 完成。队列满时丢弃本帧动画不会影响CAN查询状态机。
+ */
+static void DirectionQueryAnimationTimerCallback(void *argument)
+{
+  UiEventMessage_t event_message;
+
+  (void)argument;
+  event_message.message_type =
+      UI_EVENT_MESSAGE_DIRECTION_QUERY_ANIMATION_TICK;
+
+  if (osMessageQueuePut(UiEventQueueHandle,
+                        &event_message,
+                        0U,
+                        0U) != osOK)
+  {
+    g_direction_query_ui_event_drop_count++;
+  }
+}
+
+/**
+ * @brief 方向命令保护时间结束后的软件定时器回调。
+ *
+ * 回调运行在FreeRTOS定时器服务任务中，所以只投递一个无数据事件；目标
+ * 通道保存在UiTask私有的direction_control中，随后由UiTask安全地读取。
+ */
+static void DirectionAutoQueryTimerCallback(void *argument)
+{
+  UiEventMessage_t event_message;
+
+  (void)argument;
+  event_message.message_type = UI_EVENT_MESSAGE_DIRECTION_AUTO_QUERY_DUE;
+
+  if (osMessageQueuePut(UiEventQueueHandle,
+                        &event_message,
+                        0U,
+                        0U) != osOK)
+  {
+    g_direction_auto_query_event_drop_count++;
+  }
 }
 
 /**
@@ -941,13 +1382,14 @@ static bool UiTask_SubmitDirectionCommand(
  * 成功反馈在此处启动，因此蜂鸣和LED表示“CanTask/libcanard已受理”，而
  * 不是仅仅表示按键长按被识别。拒绝时立即解除保护，允许用户修正后重试。
  */
-static void UiTask_HandleCanCommandResult(
+static bool UiTask_HandleCanCommandResult(
+    MotorDirectionUiView_t *view,
     UiDirectionCommandControl_t *control,
     const CanCommandResult_t *result)
 {
-  if ((control == NULL) || (result == NULL))
+  if ((view == NULL) || (control == NULL) || (result == NULL))
   {
-    return;
+    return false;
   }
 
   if ((!control->waiting_for_result) ||
@@ -957,7 +1399,7 @@ static void UiTask_HandleCanCommandResult(
       (result->direction != control->pending_direction))
   {
     g_ui_direction_command_stale_result_count++;
-    return;
+    return false;
   }
 
   control->waiting_for_result = false;
@@ -965,18 +1407,56 @@ static void UiTask_HandleCanCommandResult(
   if ((result->status == CAN_COMMAND_RESULT_ACCEPTED) &&
       (result->transport_result > 0))
   {
+    const uint32_t now_tick = osKernelGetTickCount();
+    const int32_t remaining_ticks =
+        (int32_t)(control->protection_deadline_tick - now_tick);
+    const uint32_t auto_query_delay_ticks =
+        (remaining_ticks > 0) ? (uint32_t)remaining_ticks : 1U;
+
     /* 保护截止时间保持不变，成功反馈不延长2秒执行窗口。 */
     g_ui_direction_command_accepted_count++;
+    /*
+     * DirectionCommand没有远端完成应答，不能把目标方向直接当成已验证结果。
+     * 清除受影响通道的查询有效位，使其恢复紫色，直到下一次实际查询。
+     */
+    view->queried_direction_valid_mask &= (uint8_t)~result->motor_mask;
+    view->queried_direction_reversed_mask &=
+        view->queried_direction_valid_mask;
+
+    /*
+     * 接收板完整换向状态机约需1590 ms。这里等到既有2秒保护截止时间，
+     * 再自动查询刚修改的一路，保留约410 ms执行余量。一次性定时器不会
+     * 阻塞UiTask；到期后顶栏三点沿用现有查询动画。
+     */
+    control->auto_query_pending = true;
+    control->auto_query_motor_mask = result->motor_mask;
+    if (DirectionAutoQueryTimerHandle != NULL)
+    {
+      (void)osTimerStop(DirectionAutoQueryTimerHandle);
+      if (osTimerStart(DirectionAutoQueryTimerHandle,
+                       auto_query_delay_ticks) == osOK)
+      {
+        g_direction_auto_query_scheduled_count++;
+      }
+      else
+      {
+        control->auto_query_pending = false;
+        control->auto_query_motor_mask = 0U;
+      }
+    }
     DirectionLedFeedback_Start();
     DirectionBuzzFeedback();
-    return;
+    return true;
   }
 
   /* 未成功加入libcanard队列，不存在接收板忙碌风险，可立即重试。 */
   control->protection_active = false;
   control->pending_token = 0U;
   control->pending_motor_mask = 0U;
+  control->auto_query_pending = false;
+  control->auto_query_motor_mask = 0U;
   g_ui_direction_command_rejected_count++;
+  return false;
 }
 
 /**
@@ -1114,6 +1594,304 @@ static void DirectionBuzzTimerCallback(void *argument)
                     GPIO_PIN_RESET);
 
   /* osTimerOnce到期后自动停止，不需要在回调内再次调用osTimerStop。 */
+}
+
+static void CanTask_PostDirectionQueryEvent(
+    const CanDirectionQueryControl_t *control,
+    DirectionQueryEventType_t event_type,
+    uint8_t response_status,
+    const DroneCANDirectionQueryResponse_t *response)
+{
+  UiEventMessage_t message = {0};
+  DirectionQueryEvent_t *event;
+
+  if (control == NULL)
+  {
+    return;
+  }
+
+  message.message_type = UI_EVENT_MESSAGE_DIRECTION_QUERY;
+  event = &message.data.direction_query;
+  event->request_token = control->request_token;
+  event->request_id = control->request_id;
+  event->event_type = event_type;
+  event->response_status = response_status;
+  event->query_motor_mask = control->motor_mask;
+
+  if (response != NULL)
+  {
+    event->query_motor_mask = response->query_motor_mask;
+    event->valid_mask = response->valid_mask;
+    event->reversed_mask = response->reversed_mask;
+    event->timeout_mask = response->timeout_mask;
+    event->crc_error_mask = response->crc_error_mask;
+    event->unsupported_mask = response->unsupported_mask;
+    event->protocol_error_mask = response->protocol_error_mask;
+    event->maintenance_error = response->maintenance_error;
+  }
+
+  /*
+   * ACTIVE只是进度提示，可以直接丢弃；COMPLETE/FAILED会停止动画并更新
+   * 安全状态，最多等待10 ms给UiTask腾出队列空间，显著降低终态丢失风险。
+   */
+  if (osMessageQueuePut(
+          UiEventQueueHandle,
+          &message,
+          0U,
+          (event_type == DIRECTION_QUERY_EVENT_ACTIVE)
+              ? 0U
+              : pdMS_TO_TICKS(10U)) != osOK)
+  {
+    g_direction_query_ui_event_drop_count++;
+  }
+}
+
+static void CanTask_StartDirectionQuery(
+    CanDirectionQueryControl_t *control,
+    const CanCommand_t *command)
+{
+  int16_t enqueue_result;
+  const uint32_t now_tick = osKernelGetTickCount();
+
+  if ((control == NULL) || (command == NULL) || control->active ||
+      (command->motor_mask == 0U))
+  {
+    return;
+  }
+
+  control->active = true;
+  control->awaiting_response = true;
+  control->last_operation =
+      DRONECAN_DSHOT_DIRECTIONQUERY_REQUEST_OPERATION_START_QUERY;
+  control->motor_mask = command->motor_mask;
+  control->request_token = command->request_token;
+  control->request_id = control->next_request_id;
+
+  enqueue_result = DroneCAN_SendDirectionQuery(
+      control->last_operation,
+      control->motor_mask,
+      control->request_id);
+  if (enqueue_result <= 0)
+  {
+    CanTask_PostDirectionQueryEvent(
+        control,
+        DIRECTION_QUERY_EVENT_FAILED,
+        DIRECTION_QUERY_LOCAL_STATUS_TX_ERROR,
+        NULL);
+    control->active = false;
+    return;
+  }
+
+  control->next_request_id++;
+  if (control->next_request_id == 0U)
+  {
+    control->next_request_id = 1U;
+  }
+
+  control->response_deadline_tick =
+      now_tick + pdMS_TO_TICKS(DIRECTION_QUERY_RESPONSE_TIMEOUT_MS);
+  control->overall_deadline_tick =
+      now_tick + pdMS_TO_TICKS(DIRECTION_QUERY_OVERALL_TIMEOUT_MS);
+  g_direction_query_started_count++;
+}
+
+static bool CanTask_DirectionQueryCompleteResponseIsValid(
+    const CanDirectionQueryControl_t *control,
+    const DroneCANDirectionQueryResponse_t *response)
+{
+  uint8_t failure_mask;
+  uint8_t all_result_mask;
+
+  if ((control == NULL) || (response == NULL) ||
+      (response->active_source_node_id != DRONECAN_CONTROLLER_NODE_ID) ||
+      (response->active_request_id != control->request_id) ||
+      (response->query_motor_mask != control->motor_mask) ||
+      (response->maintenance_error != 0U) ||
+      ((response->reversed_mask & (uint8_t)~response->valid_mask) != 0U))
+  {
+    return false;
+  }
+
+  failure_mask = response->timeout_mask |
+                 response->crc_error_mask |
+                 response->unsupported_mask |
+                 response->protocol_error_mask;
+  all_result_mask = response->valid_mask | failure_mask;
+
+  if (((response->valid_mask & failure_mask) != 0U) ||
+      ((all_result_mask & (uint8_t)~control->motor_mask) != 0U) ||
+      (all_result_mask != control->motor_mask))
+  {
+    return false;
+  }
+
+  /* 四类最终失败位图按DSDL约束必须两两互斥。 */
+  if (((response->timeout_mask & response->crc_error_mask) != 0U) ||
+      ((response->timeout_mask & response->unsupported_mask) != 0U) ||
+      ((response->timeout_mask & response->protocol_error_mask) != 0U) ||
+      ((response->crc_error_mask & response->unsupported_mask) != 0U) ||
+      ((response->crc_error_mask & response->protocol_error_mask) != 0U) ||
+      ((response->unsupported_mask & response->protocol_error_mask) != 0U))
+  {
+    return false;
+  }
+
+  return true;
+}
+
+static void CanTask_PollDirectionQuery(CanDirectionQueryControl_t *control)
+{
+  DroneCANDirectionQueryResponse_t response;
+  const uint32_t now_tick = osKernelGetTickCount();
+  int16_t enqueue_result;
+
+  if ((control == NULL) || (!control->active))
+  {
+    return;
+  }
+
+  if (DroneCAN_TakeDirectionQueryResponse(&response))
+  {
+    /* 保存原始响应位图，便于硬件联调时直接在调试器中观察。 */
+    g_last_direction_query_valid_mask = response.valid_mask;
+    g_last_direction_query_reversed_mask = response.reversed_mask;
+    g_last_direction_query_timeout_mask = response.timeout_mask;
+    g_last_direction_query_crc_error_mask = response.crc_error_mask;
+    g_last_direction_query_unsupported_mask = response.unsupported_mask;
+    g_last_direction_query_protocol_error_mask = response.protocol_error_mask;
+    g_last_direction_query_maintenance_error = response.maintenance_error;
+
+    if (response.request_id != control->request_id)
+    {
+      g_direction_query_stale_response_count++;
+    }
+    else if (response.protocol_version !=
+             DRONECAN_DSHOT_DIRECTIONQUERY_RESPONSE_PROTOCOL_VERSION)
+    {
+      CanTask_PostDirectionQueryEvent(
+          control,
+          DIRECTION_QUERY_EVENT_FAILED,
+          DIRECTION_QUERY_LOCAL_STATUS_INVALID_RESPONSE,
+          &response);
+      control->active = false;
+      return;
+    }
+    else
+    {
+      g_last_direction_query_status = response.status;
+
+      if (response.status ==
+          DRONECAN_DSHOT_DIRECTIONQUERY_RESPONSE_STATUS_ACCEPTED)
+      {
+        control->awaiting_response = false;
+        control->next_poll_tick =
+            now_tick +
+            pdMS_TO_TICKS(DIRECTION_QUERY_INITIAL_RESULT_DELAY_MS);
+        CanTask_PostDirectionQueryEvent(
+            control, DIRECTION_QUERY_EVENT_ACTIVE, response.status, &response);
+      }
+      else if (response.status ==
+               DRONECAN_DSHOT_DIRECTIONQUERY_RESPONSE_STATUS_IN_PROGRESS)
+      {
+        control->awaiting_response = false;
+        control->next_poll_tick =
+            now_tick + pdMS_TO_TICKS(DIRECTION_QUERY_POLL_INTERVAL_MS);
+        CanTask_PostDirectionQueryEvent(
+            control, DIRECTION_QUERY_EVENT_ACTIVE, response.status, &response);
+      }
+      else if (response.status ==
+               DRONECAN_DSHOT_DIRECTIONQUERY_RESPONSE_STATUS_COMPLETE)
+      {
+        if (CanTask_DirectionQueryCompleteResponseIsValid(control, &response))
+        {
+          CanTask_PostDirectionQueryEvent(
+              control,
+              DIRECTION_QUERY_EVENT_COMPLETE,
+              response.status,
+              &response);
+        }
+        else
+        {
+          CanTask_PostDirectionQueryEvent(
+              control,
+              DIRECTION_QUERY_EVENT_FAILED,
+              DIRECTION_QUERY_LOCAL_STATUS_INVALID_RESPONSE,
+              &response);
+        }
+        control->active = false;
+        return;
+      }
+      else
+      {
+        /* BUSY、NOT_SAFE、INVALID、NOT_FOUND、INTERNAL_ERROR等均终止本次查询。 */
+        CanTask_PostDirectionQueryEvent(
+            control,
+            DIRECTION_QUERY_EVENT_FAILED,
+            response.status,
+            &response);
+        control->active = false;
+        return;
+      }
+    }
+  }
+
+  if ((int32_t)(now_tick - control->overall_deadline_tick) >= 0)
+  {
+    CanTask_PostDirectionQueryEvent(
+        control,
+        DIRECTION_QUERY_EVENT_FAILED,
+        DIRECTION_QUERY_LOCAL_STATUS_TIMEOUT,
+        NULL);
+    control->active = false;
+    return;
+  }
+
+  if (control->awaiting_response)
+  {
+    if ((int32_t)(now_tick - control->response_deadline_tick) < 0)
+    {
+      return;
+    }
+
+    g_direction_query_response_timeout_count++;
+    enqueue_result = DroneCAN_SendDirectionQuery(
+        control->last_operation,
+        (control->last_operation ==
+         DRONECAN_DSHOT_DIRECTIONQUERY_REQUEST_OPERATION_START_QUERY)
+            ? control->motor_mask
+            : 0U,
+        control->request_id);
+    control->response_deadline_tick =
+        now_tick + pdMS_TO_TICKS(DIRECTION_QUERY_RESPONSE_TIMEOUT_MS);
+    if ((enqueue_result > 0) &&
+        (control->last_operation ==
+         DRONECAN_DSHOT_DIRECTIONQUERY_REQUEST_OPERATION_GET_RESULT))
+    {
+      g_direction_query_poll_count++;
+    }
+    return;
+  }
+
+  if ((int32_t)(now_tick - control->next_poll_tick) >= 0)
+  {
+    control->last_operation =
+        DRONECAN_DSHOT_DIRECTIONQUERY_REQUEST_OPERATION_GET_RESULT;
+    enqueue_result = DroneCAN_SendDirectionQuery(
+        control->last_operation, 0U, control->request_id);
+    if (enqueue_result > 0)
+    {
+      control->awaiting_response = true;
+      control->response_deadline_tick =
+          now_tick + pdMS_TO_TICKS(DIRECTION_QUERY_RESPONSE_TIMEOUT_MS);
+      g_direction_query_poll_count++;
+    }
+    else
+    {
+      /* libcanard暂时无法入队时500 ms后重试，仍受15 s总超时约束。 */
+      control->next_poll_tick =
+          now_tick + pdMS_TO_TICKS(DIRECTION_QUERY_POLL_INTERVAL_MS);
+    }
+  }
 }
 
 

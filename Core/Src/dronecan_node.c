@@ -1,11 +1,13 @@
 #include "dronecan_node.h"
 #include "can_port.h"
+#include "dronecan_config.h"
 #include <dronecan_dshot.DirectionCommand.h>
+#include <dronecan_dshot.DirectionQuery.h>
 #include <uavcan.equipment.esc.RawCommand.h>
 #include <canard.h>
 
-#define DRONECAN_CONTROLLER_NODE_ID    126U
 #define DRONECAN_MEMORY_POOL_SIZE      2048U  //内存池大小
+#define DRONECAN_RX_FRAME_BUDGET          8U
 
 static CanardInstance canard_instance;
 
@@ -14,20 +16,39 @@ static uint32_t memory_pool[DRONECAN_MEMORY_POOL_SIZE / sizeof(uint32_t)];
 
 //DroneCAN Transfer-ID范围为0～31,ibcanard成功入队后会自动递增。
 static uint8_t g_direction_transfer_id = 0U; 
+static uint8_t g_direction_query_transfer_id = 0U;
 
 //这个是 DirectionCommand自定义应用层的请求编号
 static uint16_t g_direction_request_id = 1U;
+static DroneCANDirectionQueryResponse_t g_direction_query_response;
+static bool g_direction_query_response_available;
+static uint64_t g_last_rx_cleanup_usec;
+
+volatile uint32_t g_dronecan_rx_frame_count;
+volatile uint32_t g_dronecan_rx_error_count;
+volatile uint32_t g_direction_query_response_count;
+
+static void DroneCAN_OnTransferReceived(CanardInstance *ins,
+                                        CanardRxTransfer *transfer);
+static bool DroneCAN_ShouldAcceptTransfer(
+    const CanardInstance *ins,
+    uint64_t *out_data_type_signature,
+    uint16_t data_type_id,
+    CanardTransferType transfer_type,
+    uint8_t source_node_id);
 
 
 void DroneCAN_Node_Init(void){
     canardInit(&canard_instance, 
         memory_pool, 
         sizeof(memory_pool), 
-        NULL,       /*当前不处理接收处理回调 */
-        NULL,       /*当前暂不接收DroneCAN transfer消息 */
+        DroneCAN_OnTransferReceived,
+        DroneCAN_ShouldAcceptTransfer,
         NULL);      /*用户上下文 */
 
     canardSetLocalNodeID(&canard_instance, DRONECAN_CONTROLLER_NODE_ID);
+    g_direction_query_response_available = false;
+    g_last_rx_cleanup_usec = 0ULL;
 
 }
 
@@ -108,6 +129,180 @@ int16_t DroneCAN_SetMotorDirection(
 
 int16_t DroneCAN_Motor1_SetNormal(void){
     return DroneCAN_SetMotorsNormal(0x01U);
+}
+
+static bool DroneCAN_ShouldAcceptTransfer(
+    const CanardInstance *ins,
+    uint64_t *out_data_type_signature,
+    uint16_t data_type_id,
+    CanardTransferType transfer_type,
+    uint8_t source_node_id)
+{
+    (void)ins;
+
+    if ((out_data_type_signature != NULL) &&
+        (transfer_type == CanardTransferTypeResponse) &&
+        (data_type_id == DRONECAN_DSHOT_DIRECTIONQUERY_ID) &&
+        (source_node_id == DRONECAN_DSHOT_NODE_ID))
+    {
+        *out_data_type_signature = DRONECAN_DSHOT_DIRECTIONQUERY_SIGNATURE;
+        return true;
+    }
+
+    return false;
+}
+
+static void DroneCAN_OnTransferReceived(CanardInstance *ins,
+                                        CanardRxTransfer *transfer)
+{
+    struct dronecan_dshot_DirectionQueryResponse decoded = {0};
+
+    (void)ins;
+
+    if ((transfer == NULL) ||
+        (transfer->transfer_type != CanardTransferTypeResponse) ||
+        (transfer->data_type_id != DRONECAN_DSHOT_DIRECTIONQUERY_ID) ||
+        (transfer->source_node_id != DRONECAN_DSHOT_NODE_ID))
+    {
+        return;
+    }
+
+    /* 生成代码约定：decode返回false表示成功，true表示Payload非法。 */
+    if (dronecan_dshot_DirectionQueryResponse_decode(transfer, &decoded))
+    {
+        g_dronecan_rx_error_count++;
+        return;
+    }
+
+    g_direction_query_response.protocol_version = decoded.protocol_version;
+    g_direction_query_response.status = decoded.status;
+    g_direction_query_response.request_id = decoded.request_id;
+    g_direction_query_response.active_source_node_id =
+        decoded.active_source_node_id;
+    g_direction_query_response.active_request_id = decoded.active_request_id;
+    g_direction_query_response.query_motor_mask = decoded.query_motor_mask;
+    g_direction_query_response.valid_mask = decoded.valid_mask;
+    g_direction_query_response.reversed_mask = decoded.reversed_mask;
+    g_direction_query_response.timeout_mask = decoded.timeout_mask;
+    g_direction_query_response.crc_error_mask = decoded.crc_error_mask;
+    g_direction_query_response.unsupported_mask = decoded.unsupported_mask;
+    g_direction_query_response.protocol_error_mask = decoded.protocol_error_mask;
+    g_direction_query_response.maintenance_error = decoded.maintenance_error;
+    g_direction_query_response_available = true;
+    g_direction_query_response_count++;
+}
+
+int16_t DroneCAN_SendDirectionQuery(uint8_t operation,
+                                    uint8_t motor_mask,
+                                    uint16_t request_id)
+{
+    struct dronecan_dshot_DirectionQueryRequest request = {0};
+    uint8_t payload[DRONECAN_DSHOT_DIRECTIONQUERY_REQUEST_MAX_SIZE] = {0};
+    uint32_t payload_length;
+
+    if ((operation !=
+         DRONECAN_DSHOT_DIRECTIONQUERY_REQUEST_OPERATION_START_QUERY) &&
+        (operation !=
+         DRONECAN_DSHOT_DIRECTIONQUERY_REQUEST_OPERATION_GET_RESULT))
+    {
+        return -CANARD_ERROR_INVALID_ARGUMENT;
+    }
+
+    if ((operation ==
+         DRONECAN_DSHOT_DIRECTIONQUERY_REQUEST_OPERATION_START_QUERY) &&
+        (motor_mask == 0U))
+    {
+        return -CANARD_ERROR_INVALID_ARGUMENT;
+    }
+
+    request.protocol_version =
+        DRONECAN_DSHOT_DIRECTIONQUERY_REQUEST_PROTOCOL_VERSION;
+    request.operation = operation;
+    request.motor_mask =
+        (operation == DRONECAN_DSHOT_DIRECTIONQUERY_REQUEST_OPERATION_START_QUERY)
+            ? motor_mask
+            : 0U;
+    request.request_id = request_id;
+    request.confirmation =
+        (operation == DRONECAN_DSHOT_DIRECTIONQUERY_REQUEST_OPERATION_START_QUERY)
+            ? DRONECAN_DSHOT_DIRECTIONQUERY_REQUEST_CONFIRMATION_VALUE
+            : 0U;
+
+    payload_length =
+        dronecan_dshot_DirectionQueryRequest_encode(&request, payload);
+    if (payload_length != DRONECAN_DSHOT_DIRECTIONQUERY_REQUEST_MAX_SIZE)
+    {
+        return -CANARD_ERROR_INTERNAL;
+    }
+
+    return canardRequestOrRespond(
+        &canard_instance,
+        DRONECAN_DSHOT_NODE_ID,
+        DRONECAN_DSHOT_DIRECTIONQUERY_SIGNATURE,
+        DRONECAN_DSHOT_DIRECTIONQUERY_ID,
+        &g_direction_query_transfer_id,
+        CANARD_TRANSFER_PRIORITY_MEDIUM,
+        CanardRequest,
+        payload,
+        (uint16_t)payload_length);
+}
+
+bool DroneCAN_TakeDirectionQueryResponse(
+    DroneCANDirectionQueryResponse_t *response)
+{
+    if ((response == NULL) || (!g_direction_query_response_available))
+    {
+        return false;
+    }
+
+    *response = g_direction_query_response;
+    g_direction_query_response_available = false;
+    return true;
+}
+
+HAL_StatusTypeDef DroneCAN_ProcessRx(void)
+{
+    CAN_PortRxFrame_t port_frame;
+    const uint64_t now_usec = (uint64_t)HAL_GetTick() * 1000ULL;
+
+    for (uint8_t index = 0U; index < DRONECAN_RX_FRAME_BUDGET; ++index)
+    {
+        CanardCANFrame canard_frame = {0};
+        HAL_StatusTypeDef status = CAN_Port_TryReceive(&port_frame);
+
+        if (status == HAL_BUSY)
+        {
+            break;
+        }
+        if (status != HAL_OK)
+        {
+            g_dronecan_rx_error_count++;
+            return status;
+        }
+
+        canard_frame.id = port_frame.extended_id | CANARD_CAN_FRAME_EFF;
+        canard_frame.data_len = port_frame.data_length;
+        for (uint8_t byte = 0U; byte < port_frame.data_length; ++byte)
+        {
+            canard_frame.data[byte] = port_frame.data[byte];
+        }
+
+        if (canardHandleRxFrame(
+                &canard_instance, &canard_frame, now_usec) < 0)
+        {
+            g_dronecan_rx_error_count++;
+        }
+        g_dronecan_rx_frame_count++;
+    }
+
+    /* 每秒释放一次未完成多帧传输留下的超时接收状态。 */
+    if ((now_usec - g_last_rx_cleanup_usec) >= 1000000ULL)
+    {
+        canardCleanupStaleTransfers(&canard_instance, now_usec);
+        g_last_rx_cleanup_usec = now_usec;
+    }
+
+    return HAL_OK;
 }
 
 int16_t DroneCAN_Motor1_SetReversed(void){
