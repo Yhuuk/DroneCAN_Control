@@ -1,0 +1,715 @@
+#include "main_ui.h"
+
+#include "lcd_init.h"
+
+#include <stddef.h>
+#include <string.h>
+
+/* 主页面使用与设计稿一致的240x120横屏逻辑坐标。 */
+#define MAIN_UI_LOGICAL_WIDTH          240U
+#define MAIN_UI_LOGICAL_HEIGHT         120U
+#define MAIN_UI_FONT_WIDTH               6U
+#define MAIN_UI_FONT_HEIGHT             12U
+
+/* 四个图标在“主页面_2.png”中的原始裁剪位置和尺寸。 */
+#define MAIN_UI_DIRECTION_ICON_X          9U
+#define MAIN_UI_DIRECTION_ICON_Y         40U
+#define MAIN_UI_DIRECTION_ICON_WIDTH     41U
+#define MAIN_UI_DIRECTION_ICON_HEIGHT    38U
+#define MAIN_UI_THROTTLE_ICON_X          70U
+#define MAIN_UI_THROTTLE_ICON_Y          45U
+#define MAIN_UI_THROTTLE_ICON_WIDTH      39U
+#define MAIN_UI_THROTTLE_ICON_HEIGHT     29U
+#define MAIN_UI_SETTINGS_ICON_X         131U
+#define MAIN_UI_SETTINGS_ICON_Y          40U
+#define MAIN_UI_SETTINGS_ICON_WIDTH      37U
+#define MAIN_UI_SETTINGS_ICON_HEIGHT     38U
+#define MAIN_UI_STATUS_ICON_X           190U
+#define MAIN_UI_STATUS_ICON_Y            47U
+#define MAIN_UI_STATUS_ICON_WIDTH        39U
+#define MAIN_UI_STATUS_ICON_HEIGHT       27U
+
+/* RGB565配色由参考图主色转换而来。 */
+#define MAIN_UI_COLOR_BACKGROUND       0x1657U /* #15CAB8 */
+#define MAIN_UI_COLOR_FOREGROUND       BLACK
+#define MAIN_UI_COLOR_CAN_ONLINE       0x2FC2U /* #29fd16 */
+#define MAIN_UI_COLOR_CAN_OFFLINE      0x8410U
+#define MAIN_UI_COLOR_THROTTLE         0xFA8BU /* #FA505C */
+#define MAIN_UI_COLOR_FOCUS            WHITE
+
+/* lcd_font.h中的6x12 ASCII字库由lcd_draw.c唯一提供定义。 */
+extern const unsigned char ascii_1206[][12];
+
+/*
+ * 只缓存一条物理扫描行，避免为完整240x120 RGB565画面分配57,600字节。
+ * MainUI只由UiTask调用，因此无需为该缓冲区增加互斥锁。
+ */
+static uint8_t g_main_ui_physical_row_buffer[LCD_W * 2U];
+
+/*
+ * 以下四组1-bit点阵直接从用户提供的“主页面_2.png”图标区域提取。
+ * 每行按从左到右、每字节低位优先保存；它们保留原图的轮廓、线宽和比例，
+ * 避免使用几何公式重新近似时出现细线或齿轮变形。总计仅占698字节Flash。
+ */
+static const uint8_t g_main_ui_direction_icon[228U] = {
+    0x00U, 0x80U, 0xFFU, 0x03U, 0x00U, 0x00U,
+    0x00U, 0xE0U, 0xFFU, 0x0FU, 0x00U, 0x00U,
+    0x00U, 0xFCU, 0xFFU, 0x3FU, 0x00U, 0x00U,
+    0x00U, 0x7EU, 0x00U, 0xFCU, 0x00U, 0x00U,
+    0x00U, 0x1FU, 0x00U, 0xF0U, 0x01U, 0x00U,
+    0x80U, 0x07U, 0x00U, 0xC0U, 0x03U, 0x00U,
+    0xC0U, 0x03U, 0x00U, 0x80U, 0x07U, 0x00U,
+    0xE0U, 0x01U, 0x00U, 0x00U, 0x0FU, 0x00U,
+    0xF0U, 0x00U, 0xFFU, 0x01U, 0x0EU, 0x00U,
+    0x70U, 0xC0U, 0xFFU, 0x07U, 0x1CU, 0x00U,
+    0x30U, 0xE0U, 0x01U, 0x0FU, 0x1CU, 0x00U,
+    0x00U, 0x78U, 0x38U, 0x1CU, 0x38U, 0x00U,
+    0x00U, 0x38U, 0x38U, 0x38U, 0x38U, 0x00U,
+    0x00U, 0x1CU, 0x38U, 0x70U, 0x70U, 0x00U,
+    0x00U, 0x6CU, 0x38U, 0x7CU, 0x70U, 0x00U,
+    0x0CU, 0xEEU, 0x00U, 0xEEU, 0x70U, 0x00U,
+    0x1EU, 0xE6U, 0x7DU, 0xEFU, 0xFCU, 0x01U,
+    0x1EU, 0x86U, 0xFFU, 0xC3U, 0xFCU, 0x01U,
+    0x3FU, 0x06U, 0xC6U, 0xC0U, 0xF8U, 0x01U,
+    0x3FU, 0x07U, 0xC6U, 0xC0U, 0xF0U, 0x00U,
+    0x3FU, 0x06U, 0xE6U, 0xC0U, 0xF0U, 0x00U,
+    0x0EU, 0xC6U, 0xFFU, 0xC3U, 0x60U, 0x00U,
+    0x0CU, 0xE6U, 0x7DU, 0xEFU, 0x00U, 0x00U,
+    0x1CU, 0xEEU, 0x00U, 0xEEU, 0x00U, 0x00U,
+    0x1CU, 0x0CU, 0x38U, 0x70U, 0x00U, 0x00U,
+    0x1CU, 0x1CU, 0x38U, 0x70U, 0x30U, 0x00U,
+    0x38U, 0x38U, 0x38U, 0x38U, 0x38U, 0x00U,
+    0x38U, 0xF0U, 0x38U, 0x1EU, 0x38U, 0x00U,
+    0x70U, 0xE0U, 0x83U, 0x0FU, 0x1CU, 0x00U,
+    0xF0U, 0xC0U, 0xFFU, 0x07U, 0x1EU, 0x00U,
+    0xE0U, 0x01U, 0xFFU, 0x01U, 0x0FU, 0x00U,
+    0xC0U, 0x03U, 0x00U, 0x80U, 0x07U, 0x00U,
+    0x80U, 0x07U, 0x00U, 0xC0U, 0x03U, 0x00U,
+    0x00U, 0x0FU, 0x00U, 0xF0U, 0x01U, 0x00U,
+    0x00U, 0x7EU, 0x00U, 0xFCU, 0x00U, 0x00U,
+    0x00U, 0xFCU, 0xFFU, 0x3FU, 0x00U, 0x00U,
+    0x00U, 0xF0U, 0xFFU, 0x0FU, 0x00U, 0x00U,
+    0x00U, 0x80U, 0xFFU, 0x01U, 0x00U, 0x00U
+};
+
+static const uint8_t g_main_ui_throttle_icon[145U] = {
+    0x00U, 0xC0U, 0xFFU, 0x01U, 0x00U,
+    0x00U, 0xF8U, 0xFFU, 0x0FU, 0x00U,
+    0x00U, 0xFEU, 0xFFU, 0x1FU, 0x00U,
+    0x00U, 0x3FU, 0x1CU, 0x7EU, 0x00U,
+    0x80U, 0x0FU, 0x1CU, 0xF8U, 0x00U,
+    0xE0U, 0x0BU, 0x1CU, 0xE8U, 0x03U,
+    0xF0U, 0x1DU, 0x1CU, 0xDCU, 0x03U,
+    0xF0U, 0x18U, 0x00U, 0x8CU, 0x07U,
+    0x78U, 0x38U, 0x00U, 0x0EU, 0x0FU,
+    0x3CU, 0x00U, 0x00U, 0x00U, 0x1EU,
+    0x7CU, 0x00U, 0x00U, 0x60U, 0x1CU,
+    0xEEU, 0x01U, 0x00U, 0x38U, 0x3BU,
+    0xEEU, 0x01U, 0x00U, 0xDCU, 0x3FU,
+    0x87U, 0x01U, 0x00U, 0x8EU, 0x73U,
+    0x07U, 0x00U, 0x80U, 0x87U, 0x71U,
+    0x07U, 0x00U, 0xC0U, 0x03U, 0x70U,
+    0x03U, 0x00U, 0xE0U, 0x01U, 0x70U,
+    0x03U, 0x00U, 0xFCU, 0x00U, 0x60U,
+    0x3FU, 0x00U, 0x7EU, 0x00U, 0x6FU,
+    0x3FU, 0x00U, 0x3EU, 0x00U, 0x6FU,
+    0x3FU, 0x00U, 0x3EU, 0x00U, 0x6EU,
+    0x03U, 0x00U, 0x3EU, 0x00U, 0x60U,
+    0x03U, 0x00U, 0x00U, 0x00U, 0x60U,
+    0x03U, 0x00U, 0x00U, 0x00U, 0x60U,
+    0x07U, 0x00U, 0x00U, 0x00U, 0x70U,
+    0x07U, 0x00U, 0x00U, 0x00U, 0x70U,
+    0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x7FU,
+    0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x7FU,
+    0xFEU, 0xFFU, 0xFFU, 0xFFU, 0x3FU
+};
+
+static const uint8_t g_main_ui_settings_icon[190U] = {
+    0x00U, 0xC0U, 0x7FU, 0x00U, 0x00U,
+    0x00U, 0xE0U, 0xFFU, 0x00U, 0x00U,
+    0x00U, 0xE0U, 0xFFU, 0x00U, 0x00U,
+    0x00U, 0xE0U, 0xE0U, 0x00U, 0x00U,
+    0x00U, 0xE0U, 0xE0U, 0x00U, 0x00U,
+    0x00U, 0xF0U, 0xE0U, 0x01U, 0x00U,
+    0xF8U, 0xFCU, 0xE0U, 0xE7U, 0x03U,
+    0xFCU, 0x7FU, 0xC0U, 0xFFU, 0x03U,
+    0xFCU, 0x1FU, 0x00U, 0xFFU, 0x07U,
+    0x9EU, 0x07U, 0x00U, 0x3CU, 0x0FU,
+    0x0EU, 0x00U, 0x00U, 0x00U, 0x0EU,
+    0x0FU, 0x00U, 0x1FU, 0x00U, 0x1EU,
+    0x07U, 0xC0U, 0x7FU, 0x00U, 0x1CU,
+    0x0FU, 0xE0U, 0xFFU, 0x00U, 0x1EU,
+    0x1FU, 0xF0U, 0xF1U, 0x01U, 0x1FU,
+    0x3EU, 0x78U, 0xC0U, 0xC3U, 0x0FU,
+    0x78U, 0x38U, 0x80U, 0xC3U, 0x03U,
+    0x38U, 0x3CU, 0x80U, 0xC3U, 0x01U,
+    0x38U, 0x1CU, 0x80U, 0x87U, 0x03U,
+    0x38U, 0x1CU, 0x00U, 0x87U, 0x03U,
+    0x38U, 0x1CU, 0x80U, 0x87U, 0x03U,
+    0x38U, 0x3CU, 0x80U, 0xC3U, 0x03U,
+    0x7CU, 0x38U, 0x80U, 0xC3U, 0x03U,
+    0x3EU, 0x78U, 0xC0U, 0x81U, 0x0FU,
+    0x1FU, 0xF0U, 0xFBU, 0x01U, 0x1FU,
+    0x07U, 0xE0U, 0xFFU, 0x00U, 0x1CU,
+    0x07U, 0xC0U, 0x3FU, 0x00U, 0x1CU,
+    0x0FU, 0x00U, 0x06U, 0x00U, 0x1EU,
+    0x0EU, 0x03U, 0x00U, 0x08U, 0x0EU,
+    0x9EU, 0x0FU, 0x00U, 0x3EU, 0x07U,
+    0xFCU, 0x1FU, 0x00U, 0xFFU, 0x07U,
+    0xF8U, 0x7FU, 0xC0U, 0xFFU, 0x03U,
+    0x78U, 0xF8U, 0xE0U, 0xE3U, 0x01U,
+    0x00U, 0xE0U, 0xE0U, 0x00U, 0x00U,
+    0x00U, 0xE0U, 0xE0U, 0x00U, 0x00U,
+    0x00U, 0xE0U, 0xE0U, 0x00U, 0x00U,
+    0x00U, 0xE0U, 0xFFU, 0x00U, 0x00U,
+    0x00U, 0xC0U, 0x7FU, 0x00U, 0x00U
+};
+
+static const uint8_t g_main_ui_status_icon[135U] = {
+    0xFEU, 0xFFU, 0xFFU, 0xFFU, 0x3FU,
+    0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x7FU,
+    0x07U, 0x00U, 0x00U, 0x00U, 0x70U,
+    0x03U, 0x00U, 0x00U, 0x00U, 0x70U,
+    0x03U, 0x00U, 0x00U, 0x00U, 0x60U,
+    0x03U, 0x18U, 0x00U, 0x00U, 0x60U,
+    0x03U, 0x3CU, 0x00U, 0x00U, 0x60U,
+    0x03U, 0x3CU, 0x00U, 0x00U, 0x66U,
+    0x03U, 0x3EU, 0x00U, 0x00U, 0x67U,
+    0x03U, 0x7EU, 0x08U, 0x00U, 0x67U,
+    0x03U, 0x77U, 0x1EU, 0xE0U, 0x67U,
+    0x03U, 0x77U, 0x1EU, 0xE0U, 0x67U,
+    0xFBU, 0x63U, 0xFFU, 0xE1U, 0x67U,
+    0xFBU, 0xE3U, 0xFFU, 0xEFU, 0x67U,
+    0xFBU, 0xE1U, 0xF3U, 0xFDU, 0x67U,
+    0x03U, 0xE0U, 0x03U, 0xFCU, 0x67U,
+    0x03U, 0xC0U, 0x01U, 0xFCU, 0x67U,
+    0x03U, 0xC0U, 0x00U, 0xECU, 0x66U,
+    0x07U, 0x00U, 0x00U, 0x00U, 0x70U,
+    0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x7FU,
+    0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x7FU,
+    0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x7FU,
+    0x03U, 0x80U, 0xFFU, 0xC0U, 0x66U,
+    0x03U, 0xC0U, 0xFFU, 0xE0U, 0x66U,
+    0x07U, 0x80U, 0xFFU, 0x40U, 0x72U,
+    0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x7FU,
+    0xFEU, 0xFFU, 0xFFU, 0xFFU, 0x3FU
+};
+
+static const MainUiView_t g_main_ui_safe_default_view = {
+    .node_id = 126U,
+    .can_online = false,
+    .throttle_unlocked = false,
+    .throttle_percent = 0U,
+    .focus = MAIN_UI_FOCUS_DIRECTION
+};
+
+#if (LCD_W != 120U) || (LCD_H != 240U)
+#error "MainUI software rotation expects a 120x240 LCD framebuffer"
+#endif
+
+static int32_t MainUI_Abs32(int32_t value)
+{
+    return (value < 0) ? -value : value;
+}
+
+static bool MainUI_PointInRectangle(uint16_t x,
+                                    uint16_t y,
+                                    uint16_t left,
+                                    uint16_t top,
+                                    uint16_t right,
+                                    uint16_t bottom)
+{
+    return (x >= left) && (x <= right) &&
+           (y >= top) && (y <= bottom);
+}
+
+static bool MainUI_PointOnRectangleBorder(uint16_t x,
+                                          uint16_t y,
+                                          uint16_t left,
+                                          uint16_t top,
+                                          uint16_t right,
+                                          uint16_t bottom)
+{
+    if (!MainUI_PointInRectangle(x, y, left, top, right, bottom))
+    {
+        return false;
+    }
+
+    return (x == left) || (x == right) || (y == top) || (y == bottom);
+}
+
+static bool MainUI_PointInCircle(uint16_t x,
+                                 uint16_t y,
+                                 uint16_t center_x,
+                                 uint16_t center_y,
+                                 uint16_t radius)
+{
+    const int32_t dx = (int32_t)x - (int32_t)center_x;
+    const int32_t dy = (int32_t)y - (int32_t)center_y;
+
+    return ((dx * dx) + (dy * dy)) <=
+           ((int32_t)radius * (int32_t)radius);
+}
+
+static bool MainUI_PointOnCircleBorder(uint16_t x,
+                                       uint16_t y,
+                                       uint16_t center_x,
+                                       uint16_t center_y,
+                                       uint16_t radius)
+{
+    if (!MainUI_PointInCircle(x, y, center_x, center_y, radius))
+    {
+        return false;
+    }
+
+    if (radius < 2U)
+    {
+        return true;
+    }
+
+    return !MainUI_PointInCircle(
+        x, y, center_x, center_y, (uint16_t)(radius - 1U));
+}
+
+/** @brief 判断像素是否位于一条约1像素宽的线段上。 */
+static bool MainUI_PointOnLine(uint16_t x,
+                               uint16_t y,
+                               uint16_t x0,
+                               uint16_t y0,
+                               uint16_t x1,
+                               uint16_t y1)
+{
+    const int32_t dx = (int32_t)x1 - (int32_t)x0;
+    const int32_t dy = (int32_t)y1 - (int32_t)y0;
+    const int32_t px = (int32_t)x - (int32_t)x0;
+    const int32_t py = (int32_t)y - (int32_t)y0;
+    const int32_t cross = MainUI_Abs32((px * dy) - (py * dx));
+    const int32_t tolerance =
+        (MainUI_Abs32(dx) > MainUI_Abs32(dy))
+            ? MainUI_Abs32(dx)
+            : MainUI_Abs32(dy);
+    const uint16_t min_x = (x0 < x1) ? x0 : x1;
+    const uint16_t max_x = (x0 > x1) ? x0 : x1;
+    const uint16_t min_y = (y0 < y1) ? y0 : y1;
+    const uint16_t max_y = (y0 > y1) ? y0 : y1;
+
+    if ((x < min_x) || (x > max_x) || (y < min_y) || (y > max_y))
+    {
+        return false;
+    }
+
+    return cross <= tolerance;
+}
+
+/** @brief 判断像素是否在圆角矩形内部，用于生成入口焦点轮廓。 */
+static bool MainUI_PointInRoundedRectangle(uint16_t x,
+                                           uint16_t y,
+                                           uint16_t left,
+                                           uint16_t top,
+                                           uint16_t right,
+                                           uint16_t bottom,
+                                           uint16_t radius)
+{
+    if (!MainUI_PointInRectangle(x, y, left, top, right, bottom))
+    {
+        return false;
+    }
+
+    if ((x >= (left + radius)) && (x <= (right - radius)))
+    {
+        return true;
+    }
+    if ((y >= (top + radius)) && (y <= (bottom - radius)))
+    {
+        return true;
+    }
+
+    return MainUI_PointInCircle(x, y, left + radius, top + radius, radius) ||
+           MainUI_PointInCircle(x, y, right - radius, top + radius, radius) ||
+           MainUI_PointInCircle(x, y, left + radius, bottom - radius, radius) ||
+           MainUI_PointInCircle(x, y, right - radius, bottom - radius, radius);
+}
+
+static bool MainUI_PointOnRoundedRectangleBorder(uint16_t x,
+                                                 uint16_t y,
+                                                 uint16_t left,
+                                                 uint16_t top,
+                                                 uint16_t right,
+                                                 uint16_t bottom,
+                                                 uint16_t radius)
+{
+    if (!MainUI_PointInRoundedRectangle(
+            x, y, left, top, right, bottom, radius))
+    {
+        return false;
+    }
+
+    if ((right - left < 3U) || (bottom - top < 3U) || (radius < 2U))
+    {
+        return true;
+    }
+
+    return !MainUI_PointInRoundedRectangle(
+        x, y, left + 1U, top + 1U, right - 1U, bottom - 1U, radius - 1U);
+}
+
+/** @brief 查询6x12 ASCII字符串在当前坐标是否有前景像素。 */
+static bool MainUI_TextPixel(uint16_t x,
+                             uint16_t y,
+                             uint16_t text_x,
+                             uint16_t text_y,
+                             const char *text)
+{
+    uint16_t character_index;
+    uint16_t local_x;
+    uint16_t local_y;
+    uint8_t character;
+    size_t text_length;
+
+    if ((text == NULL) || (x < text_x) || (y < text_y))
+    {
+        return false;
+    }
+
+    local_x = x - text_x;
+    local_y = y - text_y;
+    if (local_y >= MAIN_UI_FONT_HEIGHT)
+    {
+        return false;
+    }
+
+    character_index = local_x / MAIN_UI_FONT_WIDTH;
+    text_length = strlen(text);
+    if ((size_t)character_index >= text_length)
+    {
+        return false;
+    }
+
+    local_x %= MAIN_UI_FONT_WIDTH;
+    character = (uint8_t)text[character_index];
+    if ((character < (uint8_t)' ') || (character > (uint8_t)'~'))
+    {
+        return false;
+    }
+
+    return (ascii_1206[character - (uint8_t)' '][local_y] &
+            (uint8_t)(1U << local_x)) != 0U;
+}
+
+/** @brief 向字符串尾部追加一个0~255的十进制数，返回新的尾指针。 */
+static char *MainUI_AppendUint8(char *destination, uint8_t value)
+{
+    if (value >= 100U)
+    {
+        *destination++ = (char)('0' + (value / 100U));
+        value %= 100U;
+        *destination++ = (char)('0' + (value / 10U));
+        *destination++ = (char)('0' + (value % 10U));
+    }
+    else if (value >= 10U)
+    {
+        *destination++ = (char)('0' + (value / 10U));
+        *destination++ = (char)('0' + (value % 10U));
+    }
+    else
+    {
+        *destination++ = (char)('0' + value);
+    }
+
+    return destination;
+}
+
+static void MainUI_FormatNodeText(const MainUiView_t *view,
+                                  char node_text[8])
+{
+    char *write_pointer;
+
+    node_text[0] = 'I';
+    node_text[1] = 'D';
+    node_text[2] = ':';
+    node_text[3] = ' ';
+    write_pointer = MainUI_AppendUint8(&node_text[4], view->node_id);
+    *write_pointer = '\0';
+}
+
+/**
+ * @brief 查询一个逻辑坐标是否命中1-bit图标点阵。
+ * @param x 当前主页面的逻辑X坐标。
+ * @param y 当前主页面的逻辑Y坐标。
+ * @param left 图标左上角X坐标。
+ * @param top 图标左上角Y坐标。
+ * @param width 图标有效宽度，单位为像素。
+ * @param height 图标有效高度，单位为像素。
+ * @param bytes_per_row 点阵每行占用的字节数。
+ * @param bitmap 图标点阵首地址；每个字节的bit0对应靠左像素。
+ * @return true表示该位置应绘制图标前景色，false表示保持背景色。
+ */
+static bool MainUI_BitmapPixel(uint16_t x,
+                               uint16_t y,
+                               uint16_t left,
+                               uint16_t top,
+                               uint16_t width,
+                               uint16_t height,
+                               uint16_t bytes_per_row,
+                               const uint8_t *bitmap)
+{
+    uint16_t local_x;
+    uint16_t local_y;
+    uint32_t byte_index;
+
+    if ((bitmap == NULL) ||
+        (x < left) || (y < top) ||
+        (x >= (left + width)) || (y >= (top + height)))
+    {
+        return false;
+    }
+
+    local_x = (uint16_t)(x - left);
+    local_y = (uint16_t)(y - top);
+    byte_index = ((uint32_t)local_y * bytes_per_row) +
+                 ((uint32_t)local_x / 8U);
+
+    return (bitmap[byte_index] &
+            (uint8_t)(1U << (local_x % 8U))) != 0U;
+}
+
+static bool MainUI_DirectionIconPixel(uint16_t x, uint16_t y)
+{
+    return MainUI_BitmapPixel(x,
+                              y,
+                              MAIN_UI_DIRECTION_ICON_X,
+                              MAIN_UI_DIRECTION_ICON_Y,
+                              MAIN_UI_DIRECTION_ICON_WIDTH,
+                              MAIN_UI_DIRECTION_ICON_HEIGHT,
+                              6U,
+                              g_main_ui_direction_icon);
+}
+
+static bool MainUI_ThrottleIconPixel(uint16_t x, uint16_t y)
+{
+    return MainUI_BitmapPixel(x,
+                              y,
+                              MAIN_UI_THROTTLE_ICON_X,
+                              MAIN_UI_THROTTLE_ICON_Y,
+                              MAIN_UI_THROTTLE_ICON_WIDTH,
+                              MAIN_UI_THROTTLE_ICON_HEIGHT,
+                              5U,
+                              g_main_ui_throttle_icon);
+}
+
+static bool MainUI_SettingsIconPixel(uint16_t x, uint16_t y)
+{
+    return MainUI_BitmapPixel(x,
+                              y,
+                              MAIN_UI_SETTINGS_ICON_X,
+                              MAIN_UI_SETTINGS_ICON_Y,
+                              MAIN_UI_SETTINGS_ICON_WIDTH,
+                              MAIN_UI_SETTINGS_ICON_HEIGHT,
+                              5U,
+                              g_main_ui_settings_icon);
+}
+
+static bool MainUI_StatusIconPixel(uint16_t x, uint16_t y)
+{
+    return MainUI_BitmapPixel(x,
+                              y,
+                              MAIN_UI_STATUS_ICON_X,
+                              MAIN_UI_STATUS_ICON_Y,
+                              MAIN_UI_STATUS_ICON_WIDTH,
+                              MAIN_UI_STATUS_ICON_HEIGHT,
+                              5U,
+                              g_main_ui_status_icon);
+}
+
+static bool MainUI_LockIconPixel(uint16_t x,
+                                 uint16_t y,
+                                 bool unlocked)
+{
+    bool shackle;
+
+    if (unlocked)
+    {
+        /* 开锁时锁梁向右错开，状态变化不依赖颜色也能分辨。 */
+        shackle = (y <= 8U) &&
+            MainUI_PointOnCircleBorder(x, y, 198U, 8U, 5U) &&
+            (x >= 198U);
+    }
+    else
+    {
+        shackle = (y <= 9U) &&
+            MainUI_PointOnCircleBorder(x, y, 195U, 9U, 5U);
+    }
+
+    return shackle ||
+           MainUI_PointOnRectangleBorder(x, y, 190U, 8U, 200U, 17U) ||
+           MainUI_PointInCircle(x, y, 195U, 12U, 1U) ||
+           MainUI_PointOnLine(x, y, 195U, 13U, 195U, 15U);
+}
+
+static bool MainUI_FocusPixel(uint16_t x,
+                              uint16_t y,
+                              MainUiFocus_t focus)
+{
+    uint16_t left;
+    uint16_t top;
+    uint16_t right;
+    uint16_t bottom;
+
+    switch (focus)
+    {
+        case MAIN_UI_FOCUS_DIRECTION:
+            left = 5U; top = 39U; right = 53U; bottom = 81U;
+            break;
+        case MAIN_UI_FOCUS_THROTTLE:
+            left = 66U; top = 39U; right = 114U; bottom = 81U;
+            break;
+        case MAIN_UI_FOCUS_SETTINGS:
+            left = 126U; top = 38U; right = 174U; bottom = 82U;
+            break;
+        case MAIN_UI_FOCUS_STATUS:
+            left = 186U; top = 39U; right = 233U; bottom = 82U;
+            break;
+        default:
+            return false;
+    }
+
+    return MainUI_PointOnRoundedRectangleBorder(
+        x, y, left, top, right, bottom, 6U);
+}
+
+/** @brief 生成主页面某个240x120逻辑坐标的RGB565颜色。 */
+static uint16_t MainUI_GetLogicalPixel(uint16_t x,
+                                       uint16_t y,
+                                       const MainUiView_t *view,
+                                       const char *node_text)
+{
+    uint16_t color = MAIN_UI_COLOR_BACKGROUND;
+    const uint16_t throttle_bar_left = 41U;
+    const uint16_t throttle_bar_top = 105U;
+    const uint16_t throttle_bar_right = 103U;
+    const uint16_t throttle_bar_bottom = 112U;
+    const uint16_t throttle_bar_inner_width =
+        throttle_bar_right - throttle_bar_left - 1U;
+    const uint16_t throttle_fill_width =
+        (uint16_t)(((uint32_t)throttle_bar_inner_width *
+                    view->throttle_percent) / 100U);
+
+    if (MainUI_FocusPixel(x, y, view->focus))
+    {
+        color = MAIN_UI_COLOR_FOCUS;
+    }
+
+    if (MainUI_TextPixel(x, y, 7U, 4U, node_text) ||
+        MainUI_TextPixel(x, y, 98U, 4U, "CAN") ||
+        MainUI_DirectionIconPixel(x, y) ||
+        MainUI_ThrottleIconPixel(x, y) ||
+        MainUI_SettingsIconPixel(x, y) ||
+        MainUI_StatusIconPixel(x, y) ||
+        MainUI_LockIconPixel(x, y, view->throttle_unlocked))
+    {
+        color = MAIN_UI_COLOR_FOREGROUND;
+    }
+
+    /* 新画布使用红色THR标签和白色条形外框显示油门。 */
+    if (MainUI_TextPixel(x, y, 7U, 105U, "THR:"))
+    {
+        color = MAIN_UI_COLOR_THROTTLE;
+    }
+
+    if (MainUI_PointOnRoundedRectangleBorder(
+            x,
+            y,
+            throttle_bar_left,
+            throttle_bar_top,
+            throttle_bar_right,
+            throttle_bar_bottom,
+            3U))
+    {
+        color = WHITE;
+    }
+
+    /*
+     * 红色填充使用斜纹而非大块实色，既贴近参考图，也能在青色背景上
+     * 保持清楚但不过度刺眼。0%时填充宽度为0，只显示白色外框。
+     */
+    if ((throttle_fill_width > 0U) &&
+        (x > throttle_bar_left) &&
+        (x <= (throttle_bar_left + throttle_fill_width)) &&
+        (y > throttle_bar_top) &&
+        (y < throttle_bar_bottom) &&
+        ((((uint16_t)(x + y)) % 6U) < 4U))
+    {
+        color = MAIN_UI_COLOR_THROTTLE;
+    }
+
+    if (MainUI_PointInCircle(x, y, 138U, 10U, 4U))
+    {
+        color = view->can_online
+                    ? MAIN_UI_COLOR_CAN_ONLINE
+                    : MAIN_UI_COLOR_CAN_OFFLINE;
+    }
+
+    return color;
+}
+
+static void MainUI_ValidateView(const MainUiView_t *source,
+                                MainUiView_t *destination)
+{
+    if (destination == NULL)
+    {
+        return;
+    }
+
+    *destination = (source != NULL) ? *source : g_main_ui_safe_default_view;
+
+    if (destination->node_id > 127U)
+    {
+        destination->node_id = g_main_ui_safe_default_view.node_id;
+    }
+    if (destination->throttle_percent > 100U)
+    {
+        destination->throttle_percent = 100U;
+    }
+    if ((destination->focus != MAIN_UI_FOCUS_DIRECTION) &&
+        (destination->focus != MAIN_UI_FOCUS_THROTTLE) &&
+        (destination->focus != MAIN_UI_FOCUS_SETTINGS) &&
+        (destination->focus != MAIN_UI_FOCUS_STATUS))
+    {
+        destination->focus = MAIN_UI_FOCUS_DIRECTION;
+    }
+}
+
+void MainUI_Draw(const MainUiView_t *view)
+{
+    MainUiView_t validated_view;
+    char node_text[8];
+
+    MainUI_ValidateView(view, &validated_view);
+    MainUI_FormatNodeText(&validated_view, node_text);
+
+    /* logical_x=physical_y，logical_y=119-physical_x。 */
+    LCD_Address_Set(0U, 0U, LCD_W - 1U, LCD_H - 1U);
+
+    for (uint16_t physical_y = 0U; physical_y < LCD_H; ++physical_y)
+    {
+        uint16_t buffer_index = 0U;
+
+        for (uint16_t physical_x = 0U; physical_x < LCD_W; ++physical_x)
+        {
+            const uint16_t logical_x = physical_y;
+            const uint16_t logical_y =
+                (MAIN_UI_LOGICAL_HEIGHT - 1U) - physical_x;
+            const uint16_t color = MainUI_GetLogicalPixel(
+                logical_x,
+                logical_y,
+                &validated_view,
+                node_text);
+
+            g_main_ui_physical_row_buffer[buffer_index++] =
+                (uint8_t)(color >> 8);
+            g_main_ui_physical_row_buffer[buffer_index++] = (uint8_t)color;
+        }
+
+        LCD_WriteDataBuffer(g_main_ui_physical_row_buffer, buffer_index);
+    }
+}

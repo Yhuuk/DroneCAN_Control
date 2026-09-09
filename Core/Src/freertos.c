@@ -30,6 +30,7 @@
 #include "dronecan_config.h"
 #include "dronecan_node.h"
 #include "key_input.h"
+#include "main_ui.h"
 #include "motor_direction_ui.h"
 #include "ui_input_event.h"
 #include <dronecan_dshot.DirectionQuery.h>
@@ -96,6 +97,13 @@ typedef struct
   uint32_t next_poll_tick;
   uint32_t overall_deadline_tick;
 } CanDirectionQueryControl_t;
+
+/** @brief UiTask当前显示的页面；本阶段只启用主页面。 */
+typedef enum
+{
+  UI_PAGE_MAIN = 0,
+  UI_PAGE_MOTOR_DIRECTION
+} UiPage_t;
 
 /* USER CODE END PTD */
 
@@ -507,6 +515,14 @@ void MX_FREERTOS_Init(void) {
 void StartUiTask(void *argument)
 {
   /* USER CODE BEGIN StartUiTask */
+  MainUiView_t main_view = {
+      .node_id = DRONECAN_CONTROLLER_NODE_ID,
+      .can_online = true,
+      .throttle_unlocked = false,
+      .throttle_percent = 0U,
+      .focus = MAIN_UI_FOCUS_DIRECTION
+  };
+  UiPage_t current_page = UI_PAGE_MAIN;
   MotorDirectionUiView_t view = {
       .power_state = MOTOR_DIRECTION_UI_POWER_OFF,
       .focus = MOTOR_DIRECTION_UI_FOCUS_SWITCH,
@@ -542,11 +558,11 @@ void StartUiTask(void *argument)
   (void)argument;
 
   /*
-   * UiTask是调度器启动后唯一调用显示绘制函数的任务。初始页面为OFF，
-   * 焦点包围左上角开关，符合“未确认ON时不能移动通道焦点”的安全规则。
+   * UiTask是调度器启动后唯一调用显示绘制函数的任务。开机首先绘制主页面；
+   * Node ID暂取固定配置126，CAN绿点和锁图标目前按设计稿使用静态状态。
    */
   refresh_start_tick = osKernelGetTickCount();
-  MotorDirectionUI_Draw(&view);
+  MainUI_Draw(&main_view);
   refresh_duration = osKernelGetTickCount() - refresh_start_tick;
   g_ui_last_refresh_time_ms = refresh_duration;
   g_ui_max_refresh_time_ms = refresh_duration;
@@ -576,6 +592,16 @@ void StartUiTask(void *argument)
                           NULL,
                           osWaitForever) == osOK)
     {
+      /*
+       * 本阶段只实现主页面静态呈现，尚未加入入口按键联动。主页面期间忽略
+       * 输入及旧方向面的局部更新事件，防止其覆盖主页面图标。后续实现
+       * 页面路由时，在这里处理焦点移动和Confirm/Back页面切换。
+       */
+      if (current_page == UI_PAGE_MAIN)
+      {
+        continue;
+      }
+
       if (event_message.message_type == UI_EVENT_MESSAGE_INPUT)
       {
         const MotorDirectionUiView_t previous_view = view;
