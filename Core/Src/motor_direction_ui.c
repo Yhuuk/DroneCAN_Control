@@ -4,7 +4,6 @@
 
 #include <stdbool.h>
 #include <stddef.h>
-#include <string.h>
 
 /*
  * 参考图的逻辑尺寸是240x120，而面板显存仍按120x240访问。这里明确区分
@@ -27,6 +26,27 @@
 #define UI_MAIN_DOWN_TRIANGLE_TOP_Y    93U
 #define UI_MAIN_TRIANGLE_HEIGHT        17U
 #define UI_MAIN_TRIANGLE_HALF_WIDTH    10U
+
+/*
+ * 主体动态图形的垂直边界。完整页面生成时先用这些边界排除空白区域，
+ * 避免每个背景像素都进入通道文字、三角形和焦点框的详细判断。
+ */
+#define UI_MOTOR_FOCUS_TOP_Y            37U
+#define UI_MOTOR_FOCUS_BOTTOM_Y         55U
+#define UI_NORMAL_FOCUS_TOP_Y           55U
+#define UI_NORMAL_FOCUS_BOTTOM_Y        78U
+#define UI_REVERSED_FOCUS_TOP_Y         90U
+#define UI_REVERSED_FOCUS_BOTTOM_Y     113U
+
+/*
+ * 每个通道占用一个固定宽度的X坐标单元。图形最大半宽为13像素，小于
+ * 29像素列间距的一半，因此任意像素最多只可能属于一个通道。
+ */
+#define UI_MOTOR_COLUMN_CELL_LEFT                                      \
+    (UI_MOTOR_FIRST_CENTER_X - (UI_MOTOR_COLUMN_PITCH / 2U))
+#define UI_MOTOR_COLUMN_CELL_RIGHT                                     \
+    (UI_MOTOR_COLUMN_CELL_LEFT + (UI_MOTOR_COUNT *                    \
+                                  UI_MOTOR_COLUMN_PITCH) - 1U)
 
 /*
  * 顶部方向查询动画区和NOR/REV图例布局。三个圆点由UiTask提供动画阶段，
@@ -294,20 +314,26 @@ static bool MotorDirectionUI_PointInTriangle(uint16_t x,
            (dx <= (int32_t)row_half_width);
 }
 
-/** @brief 查询6x12 ASCII字符串在指定逻辑坐标是否有前景像素。 */
+/**
+ * @brief 查询定长6x12 ASCII字符串在指定逻辑坐标是否有前景像素。
+ *
+ * 页面中的ON、OFF、NOR、REV及通道编号长度均为编译期常量，由调用方直接
+ * 传入长度，避免整屏绘制时针对每个像素重复执行strlen()。
+ */
 static bool MotorDirectionUI_TextPixel(uint16_t x,
                                        uint16_t y,
                                        uint16_t text_x,
                                        uint16_t text_y,
-                                       const char *text)
+                                       const char *text,
+                                       uint16_t text_length)
 {
     uint16_t character_index;
     uint16_t local_x;
     uint16_t local_y;
     uint8_t character;
-    size_t text_length;
 
-    if ((text == NULL) || (x < text_x) || (y < text_y))
+    if ((text == NULL) || (text_length == 0U) ||
+        (x < text_x) || (y < text_y))
     {
         return false;
     }
@@ -320,8 +346,7 @@ static bool MotorDirectionUI_TextPixel(uint16_t x,
     }
 
     character_index = local_x / UI_FONT_WIDTH;
-    text_length = strlen(text);
-    if ((size_t)character_index >= text_length)
+    if (character_index >= text_length)
     {
         return false;
     }
@@ -337,6 +362,43 @@ static bool MotorDirectionUI_TextPixel(uint16_t x,
             (uint8_t)(1U << local_x)) != 0U;
 }
 
+/**
+ * @brief 根据X坐标直接定位唯一可能覆盖该像素的电机通道。
+ *
+ * 旧实现会让每个像素依次检查8路通道。本函数先把屏幕横向划分为8个
+ * 互不重叠的29像素单元，再用一次减法和除法得到候选通道。后续只检查
+ * 这个通道；位于所有通道单元之外的像素直接返回false。
+ *
+ * @param x           240x120逻辑画布中的X坐标。
+ * @param motor_index 返回0~7的通道数组索引。
+ * @param center_x    返回该通道图形的中心X坐标。
+ * @return true表示存在候选通道；false表示该X坐标不属于通道绘图区。
+ */
+static bool MotorDirectionUI_GetMotorColumnAtX(uint16_t x,
+                                                uint8_t *motor_index,
+                                                uint16_t *center_x)
+{
+    uint16_t index;
+
+    if ((motor_index == NULL) || (center_x == NULL) ||
+        (x < UI_MOTOR_COLUMN_CELL_LEFT) ||
+        (x > UI_MOTOR_COLUMN_CELL_RIGHT))
+    {
+        return false;
+    }
+
+    index = (x - UI_MOTOR_COLUMN_CELL_LEFT) / UI_MOTOR_COLUMN_PITCH;
+    if (index >= UI_MOTOR_COUNT)
+    {
+        return false;
+    }
+
+    *motor_index = (uint8_t)index;
+    *center_x = UI_MOTOR_FIRST_CENTER_X +
+                (index * UI_MOTOR_COLUMN_PITCH);
+    return true;
+}
+
 /** @brief 生成参考页面在一个240x120逻辑坐标处的RGB565颜色。 */
 static uint16_t MotorDirectionUI_GetLogicalPixel(
     uint16_t x,
@@ -344,8 +406,8 @@ static uint16_t MotorDirectionUI_GetLogicalPixel(
     const MotorDirectionUiView_t *view)
 {
     uint16_t color = UI_COLOR_BACKGROUND;
-    uint8_t direction_dot_index;
     uint8_t motor_index;
+    uint16_t motor_center_x;
 
     /* 顶部与主体使用统一蓝灰色边框，形成分区但不抢占状态色和焦点色。 */
     if (MotorDirectionUI_PointOnRectangleBorder(
@@ -362,133 +424,165 @@ static uint16_t MotorDirectionUI_GetLogicalPixel(
     }
 
     /*
-     * 左上角使用胶囊形滑动开关：灰色外层形成轨道边缘，浅灰内层形成
-     * 轨道底色。OFF时圆点在左、文字在右；ON时二者交换位置。
+     * 顶栏之外不执行开关、状态点、图例等判断。完整刷新中约四分之三的
+     * 像素位于主体，这个一级分区可以直接跳过大量无关的几何运算。
      */
-    if (MotorDirectionUI_PointInCapsule(x, y, 2U, 3U, 43U, 19U))
+    if (y <= UI_HEADER_BOTTOM_Y)
     {
-        color = UI_COLOR_SEPARATOR;
-    }
-
-    if (MotorDirectionUI_PointInCapsule(x, y, 3U, 4U, 42U, 18U))
-    {
-        color = UI_COLOR_STATUS_BACKGROUND;
-    }
-
-    if (MotorDirectionUI_TextPixel(
-            x, y,
-            (view->power_state == MOTOR_DIRECTION_UI_POWER_ON) ? 5U : 22U,
-            5U,
-            (view->power_state == MOTOR_DIRECTION_UI_POWER_ON) ? "ON" : "OFF"))
-    {
-        color = (view->power_state == MOTOR_DIRECTION_UI_POWER_ON)
-                    ? UI_COLOR_STATUS_ON
-                    : UI_COLOR_STATUS_OFF;
-    }
-
-    if (MotorDirectionUI_PointInCircle(
-            x, y,
-            (view->power_state == MOTOR_DIRECTION_UI_POWER_ON) ? 34U : 11U,
-            11U,
-            7U))
-    {
-        color = (view->power_state == MOTOR_DIRECTION_UI_POWER_ON)
-                    ? UI_COLOR_STATUS_ON
-                    : UI_COLOR_STATUS_OFF;
-    }
-
-    /*
-     * 开关焦点使用45x21胶囊形轮廓，大小覆盖整个滑动开关，同时与页面
-     * 外框保留间隔。它只表示当前操作目标，不改变OFF/ON状态颜色。
-     */
-    if ((view->focus == MOTOR_DIRECTION_UI_FOCUS_SWITCH) &&
-        MotorDirectionUI_PointOnCapsuleBorder(x, y, 1U, 1U, 45U, 21U))
-    {
-        color = UI_COLOR_FOCUS_SWITCH;
-    }
-
-    /*
-     * 开关右侧三个圆点显示方向查询进度。空闲时三点均为青色；查询时
-     * 按1→2→3循环点亮，尚未到达的点使用低亮蓝灰色。
-     */
-    for (direction_dot_index = 0U;
-         direction_dot_index < UI_DIRECTION_DOT_COUNT;
-         ++direction_dot_index)
-    {
-        const uint16_t center_x =
-            UI_DIRECTION_DOT_FIRST_X +
-            ((uint16_t)direction_dot_index * UI_DIRECTION_DOT_PITCH);
-
-        if (MotorDirectionUI_PointInCircle(
-                x, y, center_x, UI_DIRECTION_DOT_CENTER_Y,
-                UI_DIRECTION_DOT_RADIUS))
+        if (x <= 46U)
         {
-            const bool dot_is_lit =
-                (!view->direction_query_in_progress) ||
-                (direction_dot_index < view->query_animation_dot_count);
+            /*
+             * 左上角胶囊形滑动开关：OFF时圆点在左、文字在右；ON时
+             * 二者交换位置。X范围判断先过滤顶栏中的其他所有像素。
+             */
+            if (MotorDirectionUI_PointInCapsule(
+                    x, y, 2U, 3U, 43U, 19U))
+            {
+                color = UI_COLOR_SEPARATOR;
+            }
 
-            color = dot_is_lit
-                        ? UI_COLOR_DIRECTION_DOT
-                        : UI_COLOR_DIRECTION_DOT_DIM;
+            if (MotorDirectionUI_PointInCapsule(
+                    x, y, 3U, 4U, 42U, 18U))
+            {
+                color = UI_COLOR_STATUS_BACKGROUND;
+            }
+
+            if (MotorDirectionUI_TextPixel(
+                    x, y,
+                    (view->power_state == MOTOR_DIRECTION_UI_POWER_ON)
+                        ? 5U
+                        : 22U,
+                    5U,
+                    (view->power_state == MOTOR_DIRECTION_UI_POWER_ON)
+                        ? "ON"
+                        : "OFF",
+                    (view->power_state == MOTOR_DIRECTION_UI_POWER_ON)
+                        ? 2U
+                        : 3U))
+            {
+                color = (view->power_state == MOTOR_DIRECTION_UI_POWER_ON)
+                            ? UI_COLOR_STATUS_ON
+                            : UI_COLOR_STATUS_OFF;
+            }
+
+            if (MotorDirectionUI_PointInCircle(
+                    x, y,
+                    (view->power_state == MOTOR_DIRECTION_UI_POWER_ON)
+                        ? 34U
+                        : 11U,
+                    11U,
+                    7U))
+            {
+                color = (view->power_state == MOTOR_DIRECTION_UI_POWER_ON)
+                            ? UI_COLOR_STATUS_ON
+                            : UI_COLOR_STATUS_OFF;
+            }
+
+            if ((view->focus == MOTOR_DIRECTION_UI_FOCUS_SWITCH) &&
+                MotorDirectionUI_PointOnCapsuleBorder(
+                    x, y, 1U, 1U, 45U, 21U))
+            {
+                color = UI_COLOR_FOCUS_SWITCH;
+            }
+        }
+
+        if ((x >= 52U) && (x <= 94U))
+        {
+            uint8_t direction_dot_index;
+
+            /*
+             * 三个圆点只在自己的顶栏小区域内判断。空闲时三点全亮；
+             * 查询时按UiTask提供的动画阶段显示高亮和低亮颜色。
+             */
+            for (direction_dot_index = 0U;
+                 direction_dot_index < UI_DIRECTION_DOT_COUNT;
+                 ++direction_dot_index)
+            {
+                const uint16_t center_x =
+                    UI_DIRECTION_DOT_FIRST_X +
+                    ((uint16_t)direction_dot_index *
+                     UI_DIRECTION_DOT_PITCH);
+
+                if (MotorDirectionUI_PointInCircle(
+                        x, y, center_x, UI_DIRECTION_DOT_CENTER_Y,
+                        UI_DIRECTION_DOT_RADIUS))
+                {
+                    const bool dot_is_lit =
+                        (!view->direction_query_in_progress) ||
+                        (direction_dot_index <
+                         view->query_animation_dot_count);
+
+                    color = dot_is_lit
+                                ? UI_COLOR_DIRECTION_DOT
+                                : UI_COLOR_DIRECTION_DOT_DIM;
+                }
+            }
+
+            if ((view->focus == MOTOR_DIRECTION_UI_FOCUS_STATUS_DOTS) &&
+                MotorDirectionUI_PointOnEllipseBorder(
+                    x, y,
+                    UI_DIRECTION_DOT_FOCUS_CENTER_X,
+                    UI_DIRECTION_DOT_FOCUS_CENTER_Y,
+                    UI_DIRECTION_DOT_FOCUS_RADIUS_X,
+                    UI_DIRECTION_DOT_FOCUS_RADIUS_Y))
+            {
+                color = UI_COLOR_FOCUS_STATUS_DOTS;
+            }
+        }
+
+        /* 顶部NOR图例只在其外接矩形附近执行三角形和文字判断。 */
+        if ((x >= 103U) && (x <= 143U))
+        {
+            if (MotorDirectionUI_PointInTriangle(
+                    x, y, UI_LEGEND_NOR_TRIANGLE_X,
+                    6U, 16U, 10U, true))
+            {
+                color = UI_COLOR_UP;
+            }
+
+            if (MotorDirectionUI_TextPixel(
+                    x, y, UI_LEGEND_NOR_TEXT_X, 5U, "NOR", 3U))
+            {
+                color = UI_COLOR_UP;
+            }
+        }
+
+        if ((x >= UI_LEGEND_SEPARATOR_LEFT_X) &&
+            (x <= (UI_LEGEND_SEPARATOR_LEFT_X + 1U)) &&
+            (y >= 3U) && (y <= 27U))
+        {
+            color = UI_COLOR_SEPARATOR;
+        }
+
+        /* 顶部REV图例只在其外接矩形附近执行三角形和文字判断。 */
+        if ((x >= 172U) && (x <= 213U))
+        {
+            if (MotorDirectionUI_PointInTriangle(
+                    x, y, UI_LEGEND_REV_TRIANGLE_X,
+                    6U, 16U, 10U, false))
+            {
+                color = UI_COLOR_DOWN;
+            }
+
+            if (MotorDirectionUI_TextPixel(
+                    x, y, UI_LEGEND_REV_TEXT_X, 5U, "REV", 3U))
+            {
+                color = UI_COLOR_DOWN;
+            }
         }
     }
 
     /*
-     * 三个点在业务上作为一个顶栏选项，因此只绘制一个共同的椭圆焦点，
-     * 不分别包围单个圆点。它沿用开关焦点的暖黄色，表示相同菜单层级。
+     * 主体只有37~78和90~113两段Y范围包含动态通道图形。通过Y范围和
+     * X到通道的直接映射，任意像素最多处理一路电机，彻底移除8路循环。
      */
-    if ((view->focus == MOTOR_DIRECTION_UI_FOCUS_STATUS_DOTS) &&
-        MotorDirectionUI_PointOnEllipseBorder(
-            x, y,
-            UI_DIRECTION_DOT_FOCUS_CENTER_X,
-            UI_DIRECTION_DOT_FOCUS_CENTER_Y,
-            UI_DIRECTION_DOT_FOCUS_RADIUS_X,
-            UI_DIRECTION_DOT_FOCUS_RADIUS_Y))
+    if ((((y >= UI_MOTOR_FOCUS_TOP_Y) &&
+          (y <= UI_NORMAL_FOCUS_BOTTOM_Y)) ||
+         ((y >= UI_REVERSED_FOCUS_TOP_Y) &&
+          (y <= UI_REVERSED_FOCUS_BOTTOM_Y))) &&
+        MotorDirectionUI_GetMotorColumnAtX(
+            x, &motor_index, &motor_center_x))
     {
-        color = UI_COLOR_FOCUS_STATUS_DOTS;
-    }
-
-    /*
-     * 顶部图例：上三角=NOR，下三角=REV，中间竖线用于视觉分隔。
-     * 两组图例向右重新排布，为三个圆点留出均匀且不拥挤的间距。
-     */
-    if (MotorDirectionUI_PointInTriangle(
-            x, y, UI_LEGEND_NOR_TRIANGLE_X, 6U, 16U, 10U, true))
-    {
-        color = UI_COLOR_UP;
-    }
-
-    if (MotorDirectionUI_TextPixel(
-            x, y, UI_LEGEND_NOR_TEXT_X, 5U, "NOR"))
-    {
-        color = UI_COLOR_UP;
-    }
-
-    if (MotorDirectionUI_PointInRectangle(
-            x, y,
-            UI_LEGEND_SEPARATOR_LEFT_X, 3U,
-            UI_LEGEND_SEPARATOR_LEFT_X + 1U, 27U))
-    {
-        color = UI_COLOR_SEPARATOR;
-    }
-
-    if (MotorDirectionUI_PointInTriangle(
-            x, y, UI_LEGEND_REV_TRIANGLE_X, 6U, 16U, 10U, false))
-    {
-        color = UI_COLOR_DOWN;
-    }
-
-    if (MotorDirectionUI_TextPixel(
-            x, y, UI_LEGEND_REV_TEXT_X, 5U, "REV"))
-    {
-        color = UI_COLOR_DOWN;
-    }
-
-    for (motor_index = 0U; motor_index < UI_MOTOR_COUNT; ++motor_index)
-    {
-        const uint16_t center_x =
-            UI_MOTOR_FIRST_CENTER_X +
-            ((uint16_t)motor_index * UI_MOTOR_COLUMN_PITCH);
         const char motor_number[2] = {
             (char)((uint8_t)'1' + motor_index),
             '\0'
@@ -517,28 +611,45 @@ static uint16_t MotorDirectionUI_GetLogicalPixel(
         /* 通道焦点使用柔白色19x19方框，与青色编号和蓝灰外框区分。 */
         if ((view->focus == MOTOR_DIRECTION_UI_FOCUS_MOTOR) &&
             (view->selected_motor == (uint8_t)(motor_index + 1U)) &&
+            (y >= UI_MOTOR_FOCUS_TOP_Y) &&
+            (y <= UI_MOTOR_FOCUS_BOTTOM_Y) &&
             MotorDirectionUI_PointOnRectangleBorder(
-                x, y, center_x - 9U, 37U, center_x + 9U, 55U))
+                x, y,
+                motor_center_x - 9U, UI_MOTOR_FOCUS_TOP_Y,
+                motor_center_x + 9U, UI_MOTOR_FOCUS_BOTTOM_Y))
         {
             color = UI_COLOR_FOCUS_MOTOR;
         }
 
-        if (MotorDirectionUI_TextPixel(
-                x, y, center_x - 3U, UI_MOTOR_NUMBER_Y, motor_number))
+        if ((y >= UI_MOTOR_NUMBER_Y) &&
+            (y < (UI_MOTOR_NUMBER_Y + UI_FONT_HEIGHT)) &&
+            MotorDirectionUI_TextPixel(
+                x, y, motor_center_x - 3U, UI_MOTOR_NUMBER_Y,
+                motor_number, 1U))
         {
             color = UI_COLOR_NUMBER;
         }
 
-        if (MotorDirectionUI_PointInTriangle(
-                x, y, center_x, UI_MAIN_UP_TRIANGLE_TOP_Y,
-                UI_MAIN_TRIANGLE_HEIGHT, UI_MAIN_TRIANGLE_HALF_WIDTH, true))
+        if ((y >= UI_MAIN_UP_TRIANGLE_TOP_Y) &&
+            (y < (UI_MAIN_UP_TRIANGLE_TOP_Y +
+                  UI_MAIN_TRIANGLE_HEIGHT)) &&
+            MotorDirectionUI_PointInTriangle(
+                x, y, motor_center_x, UI_MAIN_UP_TRIANGLE_TOP_Y,
+                UI_MAIN_TRIANGLE_HEIGHT,
+                UI_MAIN_TRIANGLE_HALF_WIDTH,
+                true))
         {
             color = up_triangle_color;
         }
 
-        if (MotorDirectionUI_PointInTriangle(
-                x, y, center_x, UI_MAIN_DOWN_TRIANGLE_TOP_Y,
-                UI_MAIN_TRIANGLE_HEIGHT, UI_MAIN_TRIANGLE_HALF_WIDTH, false))
+        if ((y >= UI_MAIN_DOWN_TRIANGLE_TOP_Y) &&
+            (y < (UI_MAIN_DOWN_TRIANGLE_TOP_Y +
+                  UI_MAIN_TRIANGLE_HEIGHT)) &&
+            MotorDirectionUI_PointInTriangle(
+                x, y, motor_center_x, UI_MAIN_DOWN_TRIANGLE_TOP_Y,
+                UI_MAIN_TRIANGLE_HEIGHT,
+                UI_MAIN_TRIANGLE_HALF_WIDTH,
+                false))
         {
             color = down_triangle_color;
         }
@@ -552,16 +663,17 @@ static uint16_t MotorDirectionUI_GetLogicalPixel(
         {
             const uint16_t focus_top =
                 (view->selected_direction == MOTOR_DIRECTION_UI_NORMAL)
-                    ? 55U
-                    : 90U;
+                    ? UI_NORMAL_FOCUS_TOP_Y
+                    : UI_REVERSED_FOCUS_TOP_Y;
             const uint16_t focus_bottom =
                 (view->selected_direction == MOTOR_DIRECTION_UI_NORMAL)
-                    ? 78U
-                    : 113U;
+                    ? UI_NORMAL_FOCUS_BOTTOM_Y
+                    : UI_REVERSED_FOCUS_BOTTOM_Y;
 
-            if (MotorDirectionUI_PointOnRectangleBorder(
-                    x, y, center_x - 13U, focus_top,
-                    center_x + 13U, focus_bottom))
+            if ((y >= focus_top) && (y <= focus_bottom) &&
+                MotorDirectionUI_PointOnRectangleBorder(
+                    x, y, motor_center_x - 13U, focus_top,
+                    motor_center_x + 13U, focus_bottom))
             {
                 color = UI_COLOR_FOCUS_DIRECTION;
             }
