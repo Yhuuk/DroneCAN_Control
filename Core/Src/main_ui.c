@@ -8,8 +8,19 @@
 /* 主页面使用与设计稿一致的240x120横屏逻辑坐标。 */
 #define MAIN_UI_LOGICAL_WIDTH          240U
 #define MAIN_UI_LOGICAL_HEIGHT         120U
-#define MAIN_UI_FONT_WIDTH               6U
-#define MAIN_UI_FONT_HEIGHT             12U
+#define MAIN_UI_FONT_WIDTH              12U
+#define MAIN_UI_FONT_HEIGHT             24U
+#define MAIN_UI_FONT_BYTES_PER_ROW       2U
+
+/*
+ * Node ID标签和数值分开定位，便于独立微调。
+ * 原先整串从X=0绘制时，数值位于4个字符单元之后，即X=48；
+ * 当前将数值左移4像素到X=44，"ID:"标签仍保持在X=0。
+ */
+#define MAIN_UI_NODE_LABEL_X             0U
+#define MAIN_UI_NODE_LABEL_Y             0U
+#define MAIN_UI_NODE_VALUE_X            38U
+#define MAIN_UI_NODE_VALUE_Y             0U
 
 /* 四个图标在“主页面_2.png”中的原始裁剪位置和尺寸。 */
 #define MAIN_UI_DIRECTION_ICON_X          9U
@@ -29,16 +40,26 @@
 #define MAIN_UI_STATUS_ICON_WIDTH        39U
 #define MAIN_UI_STATUS_ICON_HEIGHT       27U
 
+/* 锁图标以原图中心为基准放大约1.5倍，便于观察油门锁定状态。 */
+#define MAIN_UI_LOCK_ICON_X             186U
+#define MAIN_UI_LOCK_ICON_Y               0U
+#define MAIN_UI_LOCK_ICON_WIDTH          18U
+#define MAIN_UI_LOCK_ICON_HEIGHT         23U
+#define MAIN_UI_UNLOCKED_ICON_WIDTH      27U
+
 /* RGB565配色由参考图主色转换而来。 */
 #define MAIN_UI_COLOR_BACKGROUND       0x1657U /* #15CAB8 */
 #define MAIN_UI_COLOR_FOREGROUND       BLACK
 #define MAIN_UI_COLOR_CAN_ONLINE       0x2FC2U /* #29fd16 */
 #define MAIN_UI_COLOR_CAN_OFFLINE      0x8410U
-#define MAIN_UI_COLOR_THROTTLE         0xFA8BU /* #FA505C */
-#define MAIN_UI_COLOR_FOCUS            WHITE
+#define MAIN_UI_COLOR_THROTTLE         0xFA8BU /* #06ea11 */ /*0xFA8BU*/
+#define MAIN_UI_COLOR_FOCUS            YELLOW
 
-/* lcd_font.h中的6x12 ASCII字库由lcd_draw.c唯一提供定义。 */
-extern const unsigned char ascii_1206[][12];
+/*
+ * 12x24字高与23像素高的锁图标最接近。字库仍由lcd_draw.c唯一提供定义，
+ * 本文件只声明并读取点阵，避免在多个源文件中重复定义字库数据。
+ */
+extern const unsigned char ascii_2412[][48];
 
 /*
  * 只缓存一条物理扫描行，避免为完整240x120 RGB565画面分配57,600字节。
@@ -195,22 +216,74 @@ static const uint8_t g_main_ui_status_icon[135U] = {
     0xFEU, 0xFFU, 0xFFU, 0xFFU, 0x3FU
 };
 
+/*
+ * 锁体保持18x23不变。开锁点阵为了容纳向右伸出的锁梁，每行使用4字节
+ * 保存27个有效像素；关锁点阵每行仍使用3字节保存18个有效像素。
+ */
+static const uint8_t g_main_ui_unlocked_icon[92U] = {
+    /* 锁梁左触点右移11像素，正好落在关锁时的右触点位置。 */
+    0x00U, 0x00U, 0x7EU, 0x00U,
+    0x00U, 0x00U, 0xFFU, 0x00U,
+    0x00U, 0x80U, 0xC3U, 0x01U,
+    0x00U, 0xC0U, 0x81U, 0x03U,
+    0x00U, 0xC0U, 0x00U, 0x03U,
+    0x00U, 0xE0U, 0x00U, 0x07U,
+    0x00U, 0xE0U, 0x00U, 0x07U,
+    0x00U, 0xE0U, 0x00U, 0x07U,
+    0x00U, 0xE0U, 0x00U, 0x07U,
+    0xFCU, 0xFFU, 0x00U, 0x00U,
+    0xFFU, 0xFFU, 0x03U, 0x00U,
+    0x03U, 0x00U, 0x03U, 0x00U,
+    0x03U, 0x00U, 0x03U, 0x00U,
+    0x03U, 0x03U, 0x03U, 0x00U,
+    0x83U, 0x07U, 0x03U, 0x00U,
+    0x83U, 0x07U, 0x03U, 0x00U,
+    0x03U, 0x03U, 0x03U, 0x00U,
+    0x03U, 0x03U, 0x03U, 0x00U,
+    0x83U, 0x07U, 0x03U, 0x00U,
+    0x03U, 0x03U, 0x03U, 0x00U,
+    0x03U, 0x00U, 0x03U, 0x00U,
+    0xFFU, 0xFFU, 0x03U, 0x00U,
+    0xFEU, 0xFFU, 0x01U, 0x00U
+};
+
+static const uint8_t g_main_ui_locked_icon[69U] = {
+    0xC0U, 0x0FU, 0x00U,
+    0xE0U, 0x1FU, 0x00U,
+    0x70U, 0x38U, 0x00U,
+    0x38U, 0x70U, 0x00U,
+    0x18U, 0x60U, 0x00U,
+    0x1CU, 0xE0U, 0x00U,
+    0x1CU, 0xE0U, 0x00U,
+    0x1CU, 0xE0U, 0x00U,
+    0x1CU, 0xE0U, 0x00U,
+    0xFEU, 0xFFU, 0x01U,
+    0xFFU, 0xFFU, 0x03U,
+    0x03U, 0x00U, 0x03U,
+    0x03U, 0x00U, 0x03U,
+    0x03U, 0x03U, 0x03U,
+    0x83U, 0x07U, 0x03U,
+    0x83U, 0x07U, 0x03U,
+    0x83U, 0x07U, 0x03U,
+    0x03U, 0x03U, 0x03U,
+    0x83U, 0x07U, 0x03U,
+    0x83U, 0x07U, 0x03U,
+    0x03U, 0x00U, 0x03U,
+    0xFFU, 0xFFU, 0x03U,
+    0xFEU, 0xFFU, 0x01U
+};
+
 static const MainUiView_t g_main_ui_safe_default_view = {
     .node_id = 126U,
     .can_online = false,
     .throttle_unlocked = false,
-    .throttle_percent = 0U,
+    .throttle_percent = 20U,
     .focus = MAIN_UI_FOCUS_DIRECTION
 };
 
 #if (LCD_W != 120U) || (LCD_H != 240U)
 #error "MainUI software rotation expects a 120x240 LCD framebuffer"
 #endif
-
-static int32_t MainUI_Abs32(int32_t value)
-{
-    return (value < 0) ? -value : value;
-}
 
 static bool MainUI_PointInRectangle(uint16_t x,
                                     uint16_t y,
@@ -221,21 +294,6 @@ static bool MainUI_PointInRectangle(uint16_t x,
 {
     return (x >= left) && (x <= right) &&
            (y >= top) && (y <= bottom);
-}
-
-static bool MainUI_PointOnRectangleBorder(uint16_t x,
-                                          uint16_t y,
-                                          uint16_t left,
-                                          uint16_t top,
-                                          uint16_t right,
-                                          uint16_t bottom)
-{
-    if (!MainUI_PointInRectangle(x, y, left, top, right, bottom))
-    {
-        return false;
-    }
-
-    return (x == left) || (x == right) || (y == top) || (y == bottom);
 }
 
 static bool MainUI_PointInCircle(uint16_t x,
@@ -249,56 +307,6 @@ static bool MainUI_PointInCircle(uint16_t x,
 
     return ((dx * dx) + (dy * dy)) <=
            ((int32_t)radius * (int32_t)radius);
-}
-
-static bool MainUI_PointOnCircleBorder(uint16_t x,
-                                       uint16_t y,
-                                       uint16_t center_x,
-                                       uint16_t center_y,
-                                       uint16_t radius)
-{
-    if (!MainUI_PointInCircle(x, y, center_x, center_y, radius))
-    {
-        return false;
-    }
-
-    if (radius < 2U)
-    {
-        return true;
-    }
-
-    return !MainUI_PointInCircle(
-        x, y, center_x, center_y, (uint16_t)(radius - 1U));
-}
-
-/** @brief 判断像素是否位于一条约1像素宽的线段上。 */
-static bool MainUI_PointOnLine(uint16_t x,
-                               uint16_t y,
-                               uint16_t x0,
-                               uint16_t y0,
-                               uint16_t x1,
-                               uint16_t y1)
-{
-    const int32_t dx = (int32_t)x1 - (int32_t)x0;
-    const int32_t dy = (int32_t)y1 - (int32_t)y0;
-    const int32_t px = (int32_t)x - (int32_t)x0;
-    const int32_t py = (int32_t)y - (int32_t)y0;
-    const int32_t cross = MainUI_Abs32((px * dy) - (py * dx));
-    const int32_t tolerance =
-        (MainUI_Abs32(dx) > MainUI_Abs32(dy))
-            ? MainUI_Abs32(dx)
-            : MainUI_Abs32(dy);
-    const uint16_t min_x = (x0 < x1) ? x0 : x1;
-    const uint16_t max_x = (x0 > x1) ? x0 : x1;
-    const uint16_t min_y = (y0 < y1) ? y0 : y1;
-    const uint16_t max_y = (y0 > y1) ? y0 : y1;
-
-    if ((x < min_x) || (x > max_x) || (y < min_y) || (y > max_y))
-    {
-        return false;
-    }
-
-    return cross <= tolerance;
 }
 
 /** @brief 判断像素是否在圆角矩形内部，用于生成入口焦点轮廓。 */
@@ -350,10 +358,16 @@ static bool MainUI_PointOnRoundedRectangleBorder(uint16_t x,
     }
 
     return !MainUI_PointInRoundedRectangle(
-        x, y, left + 1U, top + 1U, right - 1U, bottom - 1U, radius - 1U);
+        x, y, left + 3U, top + 3U, right - 3U, bottom - 3U, radius - 3U);
 }
 
-/** @brief 查询6x12 ASCII字符串在当前坐标是否有前景像素。 */
+/**
+ * @brief 查询12x24 ASCII字符串在当前坐标是否有前景像素。
+ *
+ * ascii_2412的每个字符包含48字节：24行，每行12个像素占2字节。
+ * 每个字节均按低位在左的顺序保存，因此先根据Y定位行，再根据X选择
+ * 该行的第1或第2字节以及对应bit。
+ */
 static bool MainUI_TextPixel(uint16_t x,
                              uint16_t y,
                              uint16_t text_x,
@@ -363,6 +377,7 @@ static bool MainUI_TextPixel(uint16_t x,
     uint16_t character_index;
     uint16_t local_x;
     uint16_t local_y;
+    uint16_t glyph_byte_index;
     uint8_t character;
     size_t text_length;
 
@@ -386,14 +401,16 @@ static bool MainUI_TextPixel(uint16_t x,
     }
 
     local_x %= MAIN_UI_FONT_WIDTH;
+    glyph_byte_index = (local_y * MAIN_UI_FONT_BYTES_PER_ROW) +
+                       (local_x / 8U);
     character = (uint8_t)text[character_index];
     if ((character < (uint8_t)' ') || (character > (uint8_t)'~'))
     {
         return false;
     }
 
-    return (ascii_1206[character - (uint8_t)' '][local_y] &
-            (uint8_t)(1U << local_x)) != 0U;
+    return (ascii_2412[character - (uint8_t)' '][glyph_byte_index] &
+            (uint8_t)(1U << (local_x % 8U))) != 0U;
 }
 
 /** @brief 向字符串尾部追加一个0~255的十进制数，返回新的尾指针。 */
@@ -419,16 +436,13 @@ static char *MainUI_AppendUint8(char *destination, uint8_t value)
     return destination;
 }
 
-static void MainUI_FormatNodeText(const MainUiView_t *view,
-                                  char node_text[8])
+/** @brief 将Node ID数值转换为不带标签的十进制字符串。 */
+static void MainUI_FormatNodeValueText(const MainUiView_t *view,
+                                       char node_value_text[4])
 {
     char *write_pointer;
 
-    node_text[0] = 'I';
-    node_text[1] = 'D';
-    node_text[2] = ':';
-    node_text[3] = ' ';
-    write_pointer = MainUI_AppendUint8(&node_text[4], view->node_id);
+    write_pointer = MainUI_AppendUint8(node_value_text, view->node_id);
     *write_pointer = '\0';
 }
 
@@ -525,25 +539,26 @@ static bool MainUI_LockIconPixel(uint16_t x,
                                  uint16_t y,
                                  bool unlocked)
 {
-    bool shackle;
-
     if (unlocked)
     {
-        /* 开锁时锁梁向右错开，状态变化不依赖颜色也能分辨。 */
-        shackle = (y <= 8U) &&
-            MainUI_PointOnCircleBorder(x, y, 198U, 8U, 5U) &&
-            (x >= 198U);
-    }
-    else
-    {
-        shackle = (y <= 9U) &&
-            MainUI_PointOnCircleBorder(x, y, 195U, 9U, 5U);
+        return MainUI_BitmapPixel(x,
+                                  y,
+                                  MAIN_UI_LOCK_ICON_X,
+                                  MAIN_UI_LOCK_ICON_Y,
+                                  MAIN_UI_UNLOCKED_ICON_WIDTH,
+                                  MAIN_UI_LOCK_ICON_HEIGHT,
+                                  4U,
+                                  g_main_ui_unlocked_icon);
     }
 
-    return shackle ||
-           MainUI_PointOnRectangleBorder(x, y, 190U, 8U, 200U, 17U) ||
-           MainUI_PointInCircle(x, y, 195U, 12U, 1U) ||
-           MainUI_PointOnLine(x, y, 195U, 13U, 195U, 15U);
+    return MainUI_BitmapPixel(x,
+                              y,
+                              MAIN_UI_LOCK_ICON_X,
+                              MAIN_UI_LOCK_ICON_Y,
+                              MAIN_UI_LOCK_ICON_WIDTH,
+                              MAIN_UI_LOCK_ICON_HEIGHT,
+                              3U,
+                              g_main_ui_locked_icon);
 }
 
 static bool MainUI_FocusPixel(uint16_t x,
@@ -558,7 +573,7 @@ static bool MainUI_FocusPixel(uint16_t x,
     switch (focus)
     {
         case MAIN_UI_FOCUS_DIRECTION:
-            left = 5U; top = 39U; right = 53U; bottom = 81U;
+            left = 5U; top = 35U; right = 53U; bottom = 83U;
             break;
         case MAIN_UI_FOCUS_THROTTLE:
             left = 66U; top = 39U; right = 114U; bottom = 81U;
@@ -581,12 +596,12 @@ static bool MainUI_FocusPixel(uint16_t x,
 static uint16_t MainUI_GetLogicalPixel(uint16_t x,
                                        uint16_t y,
                                        const MainUiView_t *view,
-                                       const char *node_text)
+                                       const char *node_value_text)
 {
     uint16_t color = MAIN_UI_COLOR_BACKGROUND;
-    const uint16_t throttle_bar_left = 41U;
+    const uint16_t throttle_bar_left = 61U;
     const uint16_t throttle_bar_top = 105U;
-    const uint16_t throttle_bar_right = 103U;
+    const uint16_t throttle_bar_right = 123U;
     const uint16_t throttle_bar_bottom = 112U;
     const uint16_t throttle_bar_inner_width =
         throttle_bar_right - throttle_bar_left - 1U;
@@ -599,8 +614,21 @@ static uint16_t MainUI_GetLogicalPixel(uint16_t x,
         color = MAIN_UI_COLOR_FOCUS;
     }
 
-    if (MainUI_TextPixel(x, y, 7U, 4U, node_text) ||
-        MainUI_TextPixel(x, y, 98U, 4U, "CAN") ||
+    /*
+     * "ID:"与Node ID数值分别绘制，二者的坐标可通过顶部宏独立调整。
+     * 其他顶部文字仍从Y=0开始，与高度23像素的锁图标顶端对齐。
+     */
+    if (MainUI_TextPixel(x,
+                         y,
+                         MAIN_UI_NODE_LABEL_X,
+                         MAIN_UI_NODE_LABEL_Y,
+                         "ID:") ||
+        MainUI_TextPixel(x,
+                         y,
+                         MAIN_UI_NODE_VALUE_X,
+                         MAIN_UI_NODE_VALUE_Y,
+                         node_value_text) ||
+        MainUI_TextPixel(x, y, 98U, 0U, "CAN") ||
         MainUI_DirectionIconPixel(x, y) ||
         MainUI_ThrottleIconPixel(x, y) ||
         MainUI_SettingsIconPixel(x, y) ||
@@ -610,8 +638,11 @@ static uint16_t MainUI_GetLogicalPixel(uint16_t x,
         color = MAIN_UI_COLOR_FOREGROUND;
     }
 
-    /* 新画布使用红色THR标签和白色条形外框显示油门。 */
-    if (MainUI_TextPixel(x, y, 7U, 105U, "THR:"))
+    /*
+     * THR使用同一套12x24字体并贴齐屏幕底部。标签变宽后，进度条同步
+     * 右移20像素以避免重叠，其宽度及百分比计算方式保持不变。
+     */
+    if (MainUI_TextPixel(x, y, 7U, 96U, "THR:"))
     {
         color = MAIN_UI_COLOR_THROTTLE;
     }
@@ -642,7 +673,7 @@ static uint16_t MainUI_GetLogicalPixel(uint16_t x,
         color = MAIN_UI_COLOR_THROTTLE;
     }
 
-    if (MainUI_PointInCircle(x, y, 138U, 10U, 4U))
+    if (MainUI_PointInCircle(x, y, 148U, 12U, 6U))
     {
         color = view->can_online
                     ? MAIN_UI_COLOR_CAN_ONLINE
@@ -682,10 +713,10 @@ static void MainUI_ValidateView(const MainUiView_t *source,
 void MainUI_Draw(const MainUiView_t *view)
 {
     MainUiView_t validated_view;
-    char node_text[8];
+    char node_value_text[4];
 
     MainUI_ValidateView(view, &validated_view);
-    MainUI_FormatNodeText(&validated_view, node_text);
+    MainUI_FormatNodeValueText(&validated_view, node_value_text);
 
     /* logical_x=physical_y，logical_y=119-physical_x。 */
     LCD_Address_Set(0U, 0U, LCD_W - 1U, LCD_H - 1U);
@@ -703,7 +734,7 @@ void MainUI_Draw(const MainUiView_t *view)
                 logical_x,
                 logical_y,
                 &validated_view,
-                node_text);
+                node_value_text);
 
             g_main_ui_physical_row_buffer[buffer_index++] =
                 (uint8_t)(color >> 8);

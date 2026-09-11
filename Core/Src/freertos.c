@@ -519,7 +519,7 @@ void StartUiTask(void *argument)
       .node_id = DRONECAN_CONTROLLER_NODE_ID,
       .can_online = true,
       .throttle_unlocked = false,
-      .throttle_percent = 0U,
+      .throttle_percent = 100U,
       .focus = MAIN_UI_FOCUS_DIRECTION
   };
   UiPage_t current_page = UI_PAGE_MAIN;
