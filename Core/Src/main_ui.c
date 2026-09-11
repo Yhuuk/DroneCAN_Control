@@ -561,6 +561,43 @@ static bool MainUI_LockIconPixel(uint16_t x,
                               g_main_ui_locked_icon);
 }
 
+/**
+ * @brief 获取一个主页面入口对应的焦点框逻辑坐标。
+ * @return true表示入口有效且已经写入坐标，false表示入口枚举非法。
+ */
+static bool MainUI_GetFocusBounds(MainUiFocus_t focus,
+                                  uint16_t *left,
+                                  uint16_t *top,
+                                  uint16_t *right,
+                                  uint16_t *bottom)
+{
+    if ((left == NULL) || (top == NULL) ||
+        (right == NULL) || (bottom == NULL))
+    {
+        return false;
+    }
+
+    switch (focus)
+    {
+        case MAIN_UI_FOCUS_DIRECTION:
+            *left = 5U; *top = 35U; *right = 53U; *bottom = 83U;
+            break;
+        case MAIN_UI_FOCUS_THROTTLE:
+            *left = 66U; *top = 39U; *right = 114U; *bottom = 81U;
+            break;
+        case MAIN_UI_FOCUS_SETTINGS:
+            *left = 126U; *top = 38U; *right = 174U; *bottom = 82U;
+            break;
+        case MAIN_UI_FOCUS_STATUS:
+            *left = 186U; *top = 39U; *right = 233U; *bottom = 82U;
+            break;
+        default:
+            return false;
+    }
+
+    return true;
+}
+
 static bool MainUI_FocusPixel(uint16_t x,
                               uint16_t y,
                               MainUiFocus_t focus)
@@ -570,22 +607,9 @@ static bool MainUI_FocusPixel(uint16_t x,
     uint16_t right;
     uint16_t bottom;
 
-    switch (focus)
+    if (!MainUI_GetFocusBounds(focus, &left, &top, &right, &bottom))
     {
-        case MAIN_UI_FOCUS_DIRECTION:
-            left = 5U; top = 35U; right = 53U; bottom = 83U;
-            break;
-        case MAIN_UI_FOCUS_THROTTLE:
-            left = 66U; top = 39U; right = 114U; bottom = 81U;
-            break;
-        case MAIN_UI_FOCUS_SETTINGS:
-            left = 126U; top = 38U; right = 174U; bottom = 82U;
-            break;
-        case MAIN_UI_FOCUS_STATUS:
-            left = 186U; top = 39U; right = 233U; bottom = 82U;
-            break;
-        default:
-            return false;
+        return false;
     }
 
     return MainUI_PointOnRoundedRectangleBorder(
@@ -710,22 +734,73 @@ static void MainUI_ValidateView(const MainUiView_t *source,
     }
 }
 
-void MainUI_Draw(const MainUiView_t *view)
+/**
+ * @brief 重画一个包含端点的主页面逻辑矩形区域。
+ *
+ * 240x120逻辑画布旋转后写入120x240物理显存。SH8501的物理列窗口按
+ * 4像素边界向外对齐，扩展出来的少量像素也使用当前视图重新生成，
+ * 因此不会留下旧焦点边缘。
+ */
+static void MainUI_DrawLogicalRegion(const MainUiView_t *view,
+                                     uint16_t logical_left,
+                                     uint16_t logical_top,
+                                     uint16_t logical_right,
+                                     uint16_t logical_bottom)
 {
     MainUiView_t validated_view;
     char node_value_text[4];
+    uint16_t physical_left;
+    uint16_t physical_right;
+    uint16_t physical_top;
+    uint16_t physical_bottom;
+
+    if ((logical_left > logical_right) ||
+        (logical_top > logical_bottom) ||
+        (logical_left >= MAIN_UI_LOGICAL_WIDTH) ||
+        (logical_top >= MAIN_UI_LOGICAL_HEIGHT))
+    {
+        return;
+    }
+
+    if (logical_right >= MAIN_UI_LOGICAL_WIDTH)
+    {
+        logical_right = MAIN_UI_LOGICAL_WIDTH - 1U;
+    }
+    if (logical_bottom >= MAIN_UI_LOGICAL_HEIGHT)
+    {
+        logical_bottom = MAIN_UI_LOGICAL_HEIGHT - 1U;
+    }
 
     MainUI_ValidateView(view, &validated_view);
     MainUI_FormatNodeValueText(&validated_view, node_value_text);
 
     /* logical_x=physical_y，logical_y=119-physical_x。 */
-    LCD_Address_Set(0U, 0U, LCD_W - 1U, LCD_H - 1U);
+    physical_left = (MAIN_UI_LOGICAL_HEIGHT - 1U) - logical_bottom;
+    physical_right = (MAIN_UI_LOGICAL_HEIGHT - 1U) - logical_top;
+    physical_top = logical_left;
+    physical_bottom = logical_right;
 
-    for (uint16_t physical_y = 0U; physical_y < LCD_H; ++physical_y)
+    physical_left &= (uint16_t)~3U;
+    physical_right |= 3U;
+    if (physical_right >= LCD_W)
+    {
+        physical_right = LCD_W - 1U;
+    }
+
+    LCD_Address_Set(physical_left,
+                    physical_top,
+                    physical_right,
+                    physical_bottom);
+
+    for (uint16_t physical_y = physical_top;
+         physical_y <= physical_bottom;
+         ++physical_y)
     {
         uint16_t buffer_index = 0U;
 
-        for (uint16_t physical_x = 0U; physical_x < LCD_W; ++physical_x)
+        for (uint16_t physical_x = physical_left;
+             physical_x <= physical_right;
+             ++physical_x)
         {
             const uint16_t logical_x = physical_y;
             const uint16_t logical_y =
@@ -742,5 +817,58 @@ void MainUI_Draw(const MainUiView_t *view)
         }
 
         LCD_WriteDataBuffer(g_main_ui_physical_row_buffer, buffer_index);
+    }
+}
+
+void MainUI_Draw(const MainUiView_t *view)
+{
+    MainUI_DrawLogicalRegion(view,
+                             0U,
+                             0U,
+                             MAIN_UI_LOGICAL_WIDTH - 1U,
+                             MAIN_UI_LOGICAL_HEIGHT - 1U);
+}
+
+void MainUI_UpdateFocus(const MainUiView_t *previous_view,
+                        const MainUiView_t *current_view)
+{
+    MainUiView_t previous;
+    MainUiView_t current;
+    uint16_t left;
+    uint16_t top;
+    uint16_t right;
+    uint16_t bottom;
+
+    if ((previous_view == NULL) || (current_view == NULL))
+    {
+        MainUI_Draw(current_view);
+        return;
+    }
+
+    MainUI_ValidateView(previous_view, &previous);
+    MainUI_ValidateView(current_view, &current);
+    if (previous.focus == current.focus)
+    {
+        return;
+    }
+
+    /* 使用新视图重画旧焦点区域，先恢复被旧边框覆盖的背景和图标。 */
+    if (MainUI_GetFocusBounds(previous.focus,
+                              &left,
+                              &top,
+                              &right,
+                              &bottom))
+    {
+        MainUI_DrawLogicalRegion(&current, left, top, right, bottom);
+    }
+
+    /* 再只重画新焦点区域，不发送与焦点无关的顶部和底部画面。 */
+    if (MainUI_GetFocusBounds(current.focus,
+                              &left,
+                              &top,
+                              &right,
+                              &bottom))
+    {
+        MainUI_DrawLogicalRegion(&current, left, top, right, bottom);
     }
 }

@@ -20,9 +20,9 @@ typedef enum
 /**
  * @brief 绘制主页面所需的显示状态。
  *
- * 当前阶段这些字段只用于静态显示，尚未与CAN在线检测、油门业务和按键
- * 页面切换联动。提前集中在视图结构体中，后续接入真实状态时无需修改
- * 底层绘图接口。
+ * focus字段已经由UiTask的UP/DOWN按键和页面路由维护；Node ID、CAN状态、
+ * 油门锁及百分比仍通过本结构体统一传给绘图层。后续接入真实业务状态时
+ * 无需修改底层绘图接口。
  */
 typedef struct
 {
@@ -51,6 +51,18 @@ typedef struct
  * @param view 主页面状态；NULL或字段非法时使用安全默认值。
  */
 void MainUI_Draw(const MainUiView_t *view);
+
+/**
+ * @brief 仅更新主页面的旧、新焦点框区域。
+ *
+ * 用当前视图恢复旧焦点区域，再绘制新焦点区域，避免按键选择入口时刷新
+ * 完整屏幕。若任一参数为NULL，则退回完整页面绘制。
+ *
+ * @param previous_view 焦点移动前的主页面状态。
+ * @param current_view  焦点移动后的主页面状态。
+ */
+void MainUI_UpdateFocus(const MainUiView_t *previous_view,
+                        const MainUiView_t *current_view);
 
 #ifdef __cplusplus
 }

@@ -48,3 +48,24 @@ osMessageQueuePut(UiEventQueueHandle,
 | `pending_direction` | 当前等待命令设置的方向 |
 | `next_token` | 下一条新命令应该使用的编号 |
 | `protection_deadline_tick` | 保护结束的系统Tick时刻 |
+
+
+## `Release` 编译烧录
+1. 编译
+```bash
+cmake --preset Release
+
+cmake --build --preset Release --target DrondCAN_Control
+```
+2. 烧录
+```bash
+& "E:/cubemx_keli5/cubemx/openocd-20240916/OpenOCD-20240916-0.12.0/bin/openocd.exe" `
+-s "E:/cubemx_keli5/cubemx/openocd-20240916/OpenOCD-20240916-0.12.0/share/openocd/scripts" `
+-f "interface/cmsis-dap.cfg" `
+-c "transport select swd" `
+-f "target/stm32l4x.cfg" `
+-c "adapter speed 1000" `
+-c "program build/Release/DrondCAN_Control.elf verify reset exit"
+```
+
+**说明**: 目前`tasks.json` 中配置的`编译、烧录` 快捷键是 `Debug`，所以如果使用 `Release` 就可以使用上面的指令完成

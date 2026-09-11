@@ -98,7 +98,7 @@ typedef struct
   uint32_t overall_deadline_tick;
 } CanDirectionQueryControl_t;
 
-/** @brief UiTask当前显示的页面；本阶段只启用主页面。 */
+/** @brief UiTask当前显示的页面；目前主页面和电机方向页面已经接通。 */
 typedef enum
 {
   UI_PAGE_MAIN = 0,
@@ -283,6 +283,12 @@ const osThreadAttr_t InputTask_attributes = {
 /* USER CODE BEGIN FunctionPrototypes */
 
 static void InputTask_PostUiEvent(const KeyEvent_t *key_event);
+static bool UiTask_HandleMainInput(MainUiView_t *view,
+                                   const UiInputEvent_t *event);
+static void UiTask_PrepareDirectionPageEntry(MotorDirectionUiView_t *view);
+static bool UiTask_ShouldLeaveDirectionPage(
+    const MotorDirectionUiView_t *view,
+    const UiInputEvent_t *event);
 static bool UiTask_HandleInputEvent(MotorDirectionUiView_t *view,
                                     UiDirectionCommandControl_t *control,
                                     UiDirectionQueryControl_t *query_control,
@@ -592,42 +598,102 @@ void StartUiTask(void *argument)
                           NULL,
                           osWaitForever) == osOK)
     {
-      /*
-       * 本阶段只实现主页面静态呈现，尚未加入入口按键联动。主页面期间忽略
-       * 输入及旧方向面的局部更新事件，防止其覆盖主页面图标。后续实现
-       * 页面路由时，在这里处理焦点移动和Confirm/Back页面切换。
-       */
-      if (current_page == UI_PAGE_MAIN)
-      {
-        continue;
-      }
-
       if (event_message.message_type == UI_EVENT_MESSAGE_INPUT)
       {
-        const MotorDirectionUiView_t previous_view = view;
-
-        /**
-         * event_message.data.input 和 view 一起决定要做什么，比如保存转向指令消息到Can队列中
-         * 
-         * direction_control是用来保存这个转向修改指令的状态的，比如是不是已经进入libcanard消息队列，是否处于2秒保护状态
-         */
-
-        if (UiTask_HandleInputEvent(&view,
-                                    &direction_control,
-                                    &query_control,
-                                    &event_message.data.input))
+        if (current_page == UI_PAGE_MAIN)
         {
-          /*
-           * 按键动作后只重画旧焦点、新焦点以及可能变化的开关区域，避免
-           * 每次操作都重新发送完整屏幕的57,600字节。
-           */
-          refresh_start_tick = osKernelGetTickCount();
-          MotorDirectionUI_Update(&previous_view, &view);
-          refresh_duration = osKernelGetTickCount() - refresh_start_tick;
-          g_ui_last_refresh_time_ms = refresh_duration;
-          if (refresh_duration > g_ui_max_refresh_time_ms)
+          const UiInputEvent_t *const input = &event_message.data.input;
+
+          if ((input->action == UI_INPUT_ACTION_SHORT_PRESS) &&
+              (input->key_id == KEY_ID_CONFIRM))
           {
-            g_ui_max_refresh_time_ms = refresh_duration;
+            switch (main_view.focus)
+            {
+              case MAIN_UI_FOCUS_DIRECTION:
+                /*
+                 * 每次进入方向页都恢复到安全的OFF开关层。查询动画和已经
+                 * 读取的8路结果由方向业务继续持有，不因页面切换而丢失。
+                 */
+                UiTask_PrepareDirectionPageEntry(&view);
+                current_page = UI_PAGE_MOTOR_DIRECTION;
+
+                refresh_start_tick = osKernelGetTickCount();
+                MotorDirectionUI_Draw(&view);
+                refresh_duration =
+                    osKernelGetTickCount() - refresh_start_tick;
+                g_ui_last_refresh_time_ms = refresh_duration;
+                if (refresh_duration > g_ui_max_refresh_time_ms)
+                {
+                  g_ui_max_refresh_time_ms = refresh_duration;
+                }
+                break;
+
+              case MAIN_UI_FOCUS_THROTTLE:
+              case MAIN_UI_FOCUS_SETTINGS:
+              case MAIN_UI_FOCUS_STATUS:
+              default:
+                /* 对应页面尚未设计，Confirm暂时保持在主页面且不刷新。 */
+                break;
+            }
+          }
+          else
+          {
+            const MainUiView_t previous_main_view = main_view;
+
+            if (UiTask_HandleMainInput(&main_view, input))
+            {
+              refresh_start_tick = osKernelGetTickCount();
+              MainUI_UpdateFocus(&previous_main_view, &main_view);
+              refresh_duration =
+                  osKernelGetTickCount() - refresh_start_tick;
+              g_ui_last_refresh_time_ms = refresh_duration;
+              if (refresh_duration > g_ui_max_refresh_time_ms)
+              {
+                g_ui_max_refresh_time_ms = refresh_duration;
+              }
+            }
+          }
+        }
+        else if (current_page == UI_PAGE_MOTOR_DIRECTION)
+        {
+          const UiInputEvent_t *const input = &event_message.data.input;
+          const MotorDirectionUiView_t previous_view = view;
+
+          if (UiTask_ShouldLeaveDirectionPage(&view, input))
+          {
+            /*
+             * 返回哪个功能入口，就把主页面焦点恢复到对应入口。目前已经
+             * 接通的子页面只有方向页，因此这里明确恢复到“转向”。
+             */
+            main_view.focus = MAIN_UI_FOCUS_DIRECTION;
+            current_page = UI_PAGE_MAIN;
+
+            refresh_start_tick = osKernelGetTickCount();
+            MainUI_Draw(&main_view);
+            refresh_duration = osKernelGetTickCount() - refresh_start_tick;
+            g_ui_last_refresh_time_ms = refresh_duration;
+            if (refresh_duration > g_ui_max_refresh_time_ms)
+            {
+              g_ui_max_refresh_time_ms = refresh_duration;
+            }
+          }
+          else if (UiTask_HandleInputEvent(&view,
+                                           &direction_control,
+                                           &query_control,
+                                           input))
+          {
+            /*
+             * 未被页面路由消费的按键继续交给原方向状态机，所以开关、
+             * 状态查询、通道选择、NOR/REV选择和发送逻辑均保持原样。
+             */
+            refresh_start_tick = osKernelGetTickCount();
+            MotorDirectionUI_Update(&previous_view, &view);
+            refresh_duration = osKernelGetTickCount() - refresh_start_tick;
+            g_ui_last_refresh_time_ms = refresh_duration;
+            if (refresh_duration > g_ui_max_refresh_time_ms)
+            {
+              g_ui_max_refresh_time_ms = refresh_duration;
+            }
           }
         }
       }
@@ -639,9 +705,10 @@ void StartUiTask(void *argument)
          * direction_control 这个参数在函数中根据情况在赋值
          */
         if (UiTask_HandleCanCommandResult(
-            &view,
-            &direction_control,
-            &event_message.data.can_command_result))
+                &view,
+                &direction_control,
+                &event_message.data.can_command_result) &&
+            (current_page == UI_PAGE_MOTOR_DIRECTION))
         {
           MotorDirectionUI_Update(&previous_view, &view);
         }
@@ -654,7 +721,8 @@ void StartUiTask(void *argument)
         if (UiTask_HandleDirectionQueryEvent(
                 &view,
                 &query_control,
-                &event_message.data.direction_query))
+                &event_message.data.direction_query) &&
+            (current_page == UI_PAGE_MOTOR_DIRECTION))
         {
           MotorDirectionUI_Update(&previous_view, &view);
         }
@@ -680,7 +748,10 @@ void StartUiTask(void *argument)
                                          motor_mask))
           {
             g_direction_auto_query_started_count++;
-            MotorDirectionUI_Update(&previous_view, &view);
+            if (current_page == UI_PAGE_MOTOR_DIRECTION)
+            {
+              MotorDirectionUI_Update(&previous_view, &view);
+            }
           }
         }
       }
@@ -695,7 +766,10 @@ void StartUiTask(void *argument)
               (view.query_animation_dot_count >= 3U)
                   ? 1U
                   : (uint8_t)(view.query_animation_dot_count + 1U);
-          MotorDirectionUI_Update(&previous_view, &view);
+          if (current_page == UI_PAGE_MOTOR_DIRECTION)
+          {
+            MotorDirectionUI_Update(&previous_view, &view);
+          }
         }
       }
       else
@@ -928,6 +1002,128 @@ static void InputTask_PostUiEvent(const KeyEvent_t *key_event)
   {
     g_ui_event_queue_full_count++;
   }
+}
+
+/**
+ * @brief 处理主页面的入口焦点选择。
+ *
+ * 当前主页面只响应UP和DOWN的短按事件。四个入口按
+ * “转向→油门→设置→状态”的顺序排列：DOWN向后选择，UP向前选择，
+ * 到达两端后首尾循环。其他按键和长按事件不改变任何状态。
+ *
+ * @param[in,out] view 主页面显示状态。
+ * @param[in] event InputTask已经完成消抖和短/长按判定的输入事件。
+ * @return true表示焦点发生变化，需要更新屏幕；false表示无需刷新。
+ */
+static bool UiTask_HandleMainInput(MainUiView_t *view,
+                                   const UiInputEvent_t *event)
+{
+  if ((view == NULL) || (event == NULL) ||
+      (event->action != UI_INPUT_ACTION_SHORT_PRESS))
+  {
+    return false;
+  }
+
+  if (event->key_id == KEY_ID_UP)
+  {
+    switch (view->focus)
+    {
+      case MAIN_UI_FOCUS_DIRECTION:
+        view->focus = MAIN_UI_FOCUS_STATUS;
+        break;
+      case MAIN_UI_FOCUS_THROTTLE:
+        view->focus = MAIN_UI_FOCUS_DIRECTION;
+        break;
+      case MAIN_UI_FOCUS_SETTINGS:
+        view->focus = MAIN_UI_FOCUS_THROTTLE;
+        break;
+      case MAIN_UI_FOCUS_STATUS:
+        view->focus = MAIN_UI_FOCUS_SETTINGS;
+        break;
+      default:
+        view->focus = MAIN_UI_FOCUS_DIRECTION;
+        break;
+    }
+
+    return true;
+  }
+
+  if (event->key_id == KEY_ID_DOWN)
+  {
+    switch (view->focus)
+    {
+      case MAIN_UI_FOCUS_DIRECTION:
+        view->focus = MAIN_UI_FOCUS_THROTTLE;
+        break;
+      case MAIN_UI_FOCUS_THROTTLE:
+        view->focus = MAIN_UI_FOCUS_SETTINGS;
+        break;
+      case MAIN_UI_FOCUS_SETTINGS:
+        view->focus = MAIN_UI_FOCUS_STATUS;
+        break;
+      case MAIN_UI_FOCUS_STATUS:
+        view->focus = MAIN_UI_FOCUS_DIRECTION;
+        break;
+      default:
+        view->focus = MAIN_UI_FOCUS_DIRECTION;
+        break;
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * @brief 准备方向页面每次进入时的安全导航状态。
+ *
+ * 只复位本页的开关、焦点和临时选择，不清除已经查询到的8路方向结果，
+ * 也不打断可能仍在进行的查询/命令控制流程。这样退出再进入时总是从
+ * OFF开关开始操作，同时后台DroneCAN状态仍保持连续。
+ */
+static void UiTask_PrepareDirectionPageEntry(MotorDirectionUiView_t *view)
+{
+  if (view == NULL)
+  {
+    return;
+  }
+
+  view->power_state = MOTOR_DIRECTION_UI_POWER_OFF;
+  view->focus = MOTOR_DIRECTION_UI_FOCUS_SWITCH;
+  view->selected_motor = 1U;
+  view->selected_direction = MOTOR_DIRECTION_UI_NORMAL;
+}
+
+/**
+ * @brief 判断一条BACK事件是否应由页面路由直接返回主页面。
+ *
+ * 长按BACK在方向页任意位置都返回；短按BACK只有在刚进入页面的默认导航
+ * 状态（OFF且焦点位于开关）才返回。其他短按BACK返回false，随后继续交给
+ * UiTask_HandleInputEvent()执行方向页原有的逐层返回逻辑。
+ *
+ * @param view 当前方向页面状态。
+ * @param event 已经完成消抖和短/长按判定的按键事件。
+ * @return true表示页面路由应返回主页面；false表示继续留在方向页面。
+ */
+static bool UiTask_ShouldLeaveDirectionPage(
+    const MotorDirectionUiView_t *view,
+    const UiInputEvent_t *event)
+{
+  if ((view == NULL) || (event == NULL) ||
+      (event->key_id != KEY_ID_BACK))
+  {
+    return false;
+  }
+
+  if (event->action == UI_INPUT_ACTION_LONG_PRESS)
+  {
+    return true;
+  }
+
+  return (event->action == UI_INPUT_ACTION_SHORT_PRESS) &&
+         (view->power_state == MOTOR_DIRECTION_UI_POWER_OFF) &&
+         (view->focus == MOTOR_DIRECTION_UI_FOCUS_SWITCH);
 }
 
 /**
