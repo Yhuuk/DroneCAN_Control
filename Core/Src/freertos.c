@@ -537,8 +537,8 @@ void StartUiTask(void *argument)
   };
   UiPage_t current_page = UI_PAGE_MAIN;
   ThrottleUiView_t throttle_view = {
-      .throttle_raw = 0U,
-      .direction_raw = 0U
+      .throttle_normalized = 0,
+      .direction_normalized = 0
   };
   MotorDirectionUiView_t view = {
       .power_state = MOTOR_DIRECTION_UI_POWER_OFF,
@@ -1039,15 +1039,16 @@ void StartInputTask(void *argument)
  */
 static bool UiTask_ReadThrottleView(ThrottleUiView_t *view)
 {
-  JoystickRawValues_t raw_values;
+  JoystickNormalizedValues_t normalized_values;
 
-  if ((view == NULL) || !Joystick_GetLatestRaw(&raw_values))
+  if ((view == NULL) ||
+      !Joystick_GetLatestNormalized(&normalized_values))
   {
     return false;
   }
 
-  view->throttle_raw = raw_values.throttle_raw;
-  view->direction_raw = raw_values.direction_raw;
+  view->throttle_normalized = normalized_values.throttle_normalized;
+  view->direction_normalized = normalized_values.direction_normalized;
   return true;
 }
 

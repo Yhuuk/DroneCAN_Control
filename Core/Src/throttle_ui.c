@@ -29,7 +29,7 @@ extern const unsigned char ascii_1608[][16];
 /* 两个固定宽度数值的逻辑坐标，用于后续局部刷新。 */
 #define THROTTLE_UI_LEFT_VALUE_X        58U
 #define THROTTLE_UI_RIGHT_VALUE_X       178U
-#define THROTTLE_UI_RAW_LABEL_Y         61U
+#define THROTTLE_UI_VALUE_LABEL_Y       61U
 #define THROTTLE_UI_VALUE_Y             59U
 
 /* 每个RGB565像素按屏幕要求存成“高字节、低字节”。 */
@@ -79,14 +79,14 @@ static bool ThrottleUI_TextPixel(uint16_t x,
 /**
  * @brief 判断像素是否属于8x16的大号ADC数值。
  *
- * 只给两个四位原始值使用更大的字库，页面标题、标签和返回提示仍保持
+ * 只给两个五位带符号校准值使用更大的字库，页面标题、标签和返回提示仍保持
  * 6x12，既增强读数可见性，也不会挤压左右两栏的固定布局。
  */
 static bool ThrottleUI_ValueTextPixel(uint16_t x,
                                       uint16_t y,
                                       uint16_t text_x,
                                       uint16_t text_y,
-                                      const char text[5])
+                                      const char text[6])
 {
     uint16_t character_index;
     uint16_t local_x;
@@ -107,7 +107,7 @@ static bool ThrottleUI_ValueTextPixel(uint16_t x,
 
     character_index =
         (uint16_t)(local_x / THROTTLE_UI_VALUE_FONT_WIDTH);
-    if (character_index >= 4U)
+    if (character_index >= 5U)
     {
         return false;
     }
@@ -123,28 +123,37 @@ static bool ThrottleUI_ValueTextPixel(uint16_t x,
 }
 
 /**
- * @brief 将 12 位 ADC 数值格式化成固定四位十进制字符。
+ * @brief 将-1000~+1000格式化为固定五位带符号十进制字符。
  *
- * 固定宽度可确保局部刷新时新数字完全覆盖旧数字，例如 4095 -> 0007。
+ * 正数显示“+”，负数显示“-”，零显示前导空格。固定宽度可确保局部刷新
+ * 时新数字完全覆盖旧数字，例如-1000变为+0007时不会留下旧像素。
  */
-static void ThrottleUI_FormatAdcValue(uint16_t value, char text[5])
+static void ThrottleUI_FormatNormalizedValue(int16_t value, char text[6])
 {
-    if (value > 4095U)
+    uint16_t magnitude;
+
+    if (value < -1000)
     {
-        value = 4095U;
+        value = -1000;
+    }
+    else if (value > 1000)
+    {
+        value = 1000;
     }
 
-    text[0] = (char)('0' + ((value / 1000U) % 10U));
-    text[1] = (char)('0' + ((value / 100U) % 10U));
-    text[2] = (char)('0' + ((value / 10U) % 10U));
-    text[3] = (char)('0' + (value % 10U));
-    text[4] = '\0';
+    text[0] = (value < 0) ? '-' : ((value > 0) ? '+' : ' ');
+    magnitude = (value < 0) ? (uint16_t)(-value) : (uint16_t)value;
+    text[1] = (char)('0' + ((magnitude / 1000U) % 10U));
+    text[2] = (char)('0' + ((magnitude / 100U) % 10U));
+    text[3] = (char)('0' + ((magnitude / 10U) % 10U));
+    text[4] = (char)('0' + (magnitude % 10U));
+    text[5] = '\0';
 }
 
 static uint16_t ThrottleUI_GetLogicalPixel(uint16_t x,
                                            uint16_t y,
-                                           const char throttle_text[5],
-                                           const char direction_text[5])
+                                           const char throttle_text[6],
+                                           const char direction_text[6])
 {
     uint16_t color = THROTTLE_UI_COLOR_BACKGROUND;
 
@@ -169,14 +178,14 @@ static uint16_t ThrottleUI_GetLogicalPixel(uint16_t x,
              ThrottleUI_TextPixel(x,
                                   y,
                                   30U,
-                                  THROTTLE_UI_RAW_LABEL_Y,
-                                  "RAW:",
+                                  THROTTLE_UI_VALUE_LABEL_Y,
+                                  "CAL:",
                                   4U) ||
              ThrottleUI_TextPixel(x,
                                   y,
                                   150U,
-                                  THROTTLE_UI_RAW_LABEL_Y,
-                                  "RAW:",
+                                  THROTTLE_UI_VALUE_LABEL_Y,
+                                  "CAL:",
                                   4U))
     {
         color = THROTTLE_UI_COLOR_LABEL;
@@ -196,10 +205,10 @@ static uint16_t ThrottleUI_GetLogicalPixel(uint16_t x,
     }
     else if (ThrottleUI_TextPixel(x,
                                   y,
-                                  84U,
+                                  78U,
                                   81U,
-                                  "12BIT 0-4095",
-                                  12U) ||
+                                  "CAL -1000~1000",
+                                  14U) ||
              ThrottleUI_TextPixel(x,
                                   y,
                                   84U,
@@ -228,8 +237,8 @@ static void ThrottleUI_DrawLogicalRegion(const ThrottleUiView_t *view,
                                          uint16_t x2,
                                          uint16_t y2)
 {
-    char throttle_text[5];
-    char direction_text[5];
+    char throttle_text[6];
+    char direction_text[6];
     uint16_t physical_left;
     uint16_t physical_right;
     uint16_t physical_top;
@@ -243,8 +252,10 @@ static void ThrottleUI_DrawLogicalRegion(const ThrottleUiView_t *view,
         return;
     }
 
-    ThrottleUI_FormatAdcValue(view->throttle_raw, throttle_text);
-    ThrottleUI_FormatAdcValue(view->direction_raw, direction_text);
+    ThrottleUI_FormatNormalizedValue(view->throttle_normalized,
+                                     throttle_text);
+    ThrottleUI_FormatNormalizedValue(view->direction_normalized,
+                                     direction_text);
 
 
     /**
@@ -322,21 +333,21 @@ void ThrottleUI_UpdateValues(const ThrottleUiView_t *previous,
         return;
     }
 
-    if (previous->throttle_raw != current->throttle_raw)
+    if (previous->throttle_normalized != current->throttle_normalized)
     {
         ThrottleUI_DrawLogicalRegion(current,
                                      56U,
                                      57U,
-                                     91U,
+                                     99U,
                                      76U);
     }
 
-    if (previous->direction_raw != current->direction_raw)
+    if (previous->direction_normalized != current->direction_normalized)
     {
         ThrottleUI_DrawLogicalRegion(current,
                                      176U,
                                      57U,
-                                     211U,
+                                     219U,
                                      76U);
     }
 }

@@ -14,8 +14,8 @@ extern "C" {
  */
 typedef struct
 {
-    uint16_t throttle_raw;
-    uint16_t direction_raw;
+    int16_t throttle_normalized;
+    int16_t direction_normalized;
 } ThrottleUiView_t;
 
 /** @brief 绘制完整的临时油门/方向 ADC 调试页面。 */

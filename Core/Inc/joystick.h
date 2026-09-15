@@ -17,14 +17,26 @@ extern "C" {
  * - direction_raw：PA0 / ADC1_IN5 / Rank 1，对应方向轴；
  * - throttle_raw：PA1 / ADC1_IN6 / Rank 2，对应油门轴。
  *
- * ADC 为 12 位，因此正常原始值范围是 0~4095。这里暂不做中心点、死区、
- * 方向翻转或量程标定，便于先直接观察摇杆和硬件 ADC 的真实输出。
+ * ADC 为 12 位，因此正常原始值范围是 0~4095。原始值接口继续保留，
+ * 便于以后检查ADC、供电和摇杆硬件。
  */
 typedef struct
 {
     uint16_t throttle_raw;
     uint16_t direction_raw;
 } JoystickRawValues_t;
+
+/**
+ * @brief 应用机械中心、死区和两侧量程校准后的摇杆快照。
+ *
+ * 两个轴均输出-1000~+1000：有效最小端为-1000，中心死区内为0，
+ * 有效最大端为+1000。当前只完成双向归一化，不在这里把油门负半轴钳位为0。
+ */
+typedef struct
+{
+    int16_t throttle_normalized;
+    int16_t direction_normalized;
+} JoystickNormalizedValues_t;
 
 /**
  * @brief 校准 ADC1，并启动两个摇杆通道的循环 DMA 采样。
@@ -43,7 +55,8 @@ HAL_StatusTypeDef Joystick_Init(void);
  * @brief 从 DMA 循环缓冲区发布一份稳定快照。
  *
  * 该函数应由 InputTask 每 10 ms 调用一次。它不等待 ADC，不操作 LCD，
- * 只复制两个半字并通过一次对齐的 32 位写操作发布快照，因此执行时间很短。
+ * 读取两个DMA半字，完成整数校准计算，并分别通过对齐的32位写操作发布
+ * 原始快照与归一化快照，因此执行时间很短。
  */
 void Joystick_Process(void);
 
@@ -56,6 +69,16 @@ void Joystick_Process(void);
  * @retval false 参数为空，或 ADC/DMA 尚未成功启动。
  */
 bool Joystick_GetLatestRaw(JoystickRawValues_t *values);
+
+/**
+ * @brief 获取InputTask最近一次发布的校准值。
+ *
+ * @param[out] values 用于接收两个-1000~+1000归一化值的结构体指针。
+ *
+ * @retval true  已经初始化且成功取得快照。
+ * @retval false 参数为空，或ADC/DMA尚未成功启动。
+ */
+bool Joystick_GetLatestNormalized(JoystickNormalizedValues_t *values);
 
 /* 调试统计量，可在调试器 Watch 窗口中直接观察。 */
 extern volatile uint32_t g_joystick_snapshot_count;
