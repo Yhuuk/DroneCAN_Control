@@ -31,6 +31,11 @@
 
 /* USER CODE BEGIN 1 */
 
+/**
+ * 这里必须先初始化 DMA，再初始化 ADC，因为后面的 MX_ADC1_Init() 会将 ADC1 与 hdma_adc1 关联起来。
+ * 
+ */
+
 /* USER CODE END 1 */
 
 /**

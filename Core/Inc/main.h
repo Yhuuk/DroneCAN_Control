@@ -57,10 +57,10 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define Throttle_Pin GPIO_PIN_0
-#define Throttle_GPIO_Port GPIOA
-#define Direction_Pin GPIO_PIN_1
+#define Direction_Pin GPIO_PIN_0
 #define Direction_GPIO_Port GPIOA
+#define Throttle_Pin GPIO_PIN_1
+#define Throttle_GPIO_Port GPIOA
 #define OLED_CS_Pin GPIO_PIN_4
 #define OLED_CS_GPIO_Port GPIOA
 #define OLED_DC_Pin GPIO_PIN_0

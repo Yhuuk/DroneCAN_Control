@@ -29,9 +29,11 @@
 #include "can_port.h"
 #include "dronecan_config.h"
 #include "dronecan_node.h"
+#include "joystick.h"
 #include "key_input.h"
 #include "main_ui.h"
 #include "motor_direction_ui.h"
+#include "throttle_ui.h"
 #include "ui_input_event.h"
 #include <dronecan_dshot.DirectionQuery.h>
 
@@ -102,7 +104,8 @@ typedef struct
 typedef enum
 {
   UI_PAGE_MAIN = 0,
-  UI_PAGE_MOTOR_DIRECTION
+  UI_PAGE_MOTOR_DIRECTION,
+  UI_PAGE_THROTTLE_DEBUG
 } UiPage_t;
 
 /* USER CODE END PTD */
@@ -125,6 +128,9 @@ typedef enum
  * 10 ms按键扫描周期。
  */
 #define UI_EVENT_QUEUE_LENGTH 16U
+
+/** 临时油门调试页以10 Hz刷新数值，读数流畅且不会持续占用SPI总线。 */
+#define THROTTLE_UI_REFRESH_PERIOD_MS 100U
 
 /** 方向反馈LED每100 ms切换一次，形成清晰的快速闪烁。 */
 #define DIRECTION_LED_FLASH_HALF_PERIOD_MS 100U
@@ -283,6 +289,7 @@ const osThreadAttr_t InputTask_attributes = {
 /* USER CODE BEGIN FunctionPrototypes */
 
 static void InputTask_PostUiEvent(const KeyEvent_t *key_event);
+static bool UiTask_ReadThrottleView(ThrottleUiView_t *view);
 static bool UiTask_HandleMainInput(MainUiView_t *view,
                                    const UiInputEvent_t *event);
 static void UiTask_PrepareDirectionPageEntry(MotorDirectionUiView_t *view);
@@ -529,6 +536,10 @@ void StartUiTask(void *argument)
       .focus = MAIN_UI_FOCUS_DIRECTION
   };
   UiPage_t current_page = UI_PAGE_MAIN;
+  ThrottleUiView_t throttle_view = {
+      .throttle_raw = 0U,
+      .direction_raw = 0U
+  };
   MotorDirectionUiView_t view = {
       .power_state = MOTOR_DIRECTION_UI_POWER_OFF,
       .focus = MOTOR_DIRECTION_UI_FOCUS_SWITCH,
@@ -560,6 +571,7 @@ void StartUiTask(void *argument)
   UiEventMessage_t event_message;
   uint32_t refresh_start_tick;
   uint32_t refresh_duration;
+  osStatus_t queue_status;
 
   (void)argument;
 
@@ -577,26 +589,41 @@ void StartUiTask(void *argument)
   for(;;)
   {
     /*
-     * osMessageQueueGet(
-     * 哪个消息队列,
-     * 消息取出来放在哪里,
-     * 是否需要获得消息优先级,
-     * 最长等待多久
-     * );
-     * 
-     * UiEventQueueHandle 是消息队列句柄
-     * 想想是怎么把数据传向 event 这个结构体的
-     * 
-     * 没有按键动作时永久阻塞，任务不占用CPU时间。InputTask写入一条
-     * UiEventMessage_t后本任务被唤醒。按键事件只有在状态真的改变时才
-     * 刷新屏幕；CAN结果事件只更新命令控制状态并触发成功反馈。
-     * 
-     * osWaitForever 是
+     * 普通页面没有周期显示需求，因此永久阻塞等待UI/CAN事件，不占CPU。
+     * 临时油门页需要显示实时ADC值，改为最多等待100 ms；超时只读取一次
+     * InputTask发布的快照并局部刷新数字，不会直接等待ADC转换。
      */
-    if (osMessageQueueGet(UiEventQueueHandle,
-                          &event_message,
-                          NULL,
-                          osWaitForever) == osOK)
+    queue_status = osMessageQueueGet(
+        UiEventQueueHandle,
+        &event_message,
+        NULL,
+        (current_page == UI_PAGE_THROTTLE_DEBUG)
+            ? pdMS_TO_TICKS(THROTTLE_UI_REFRESH_PERIOD_MS)
+            : osWaitForever);
+
+    if (queue_status == osErrorTimeout)
+    {
+      if (current_page == UI_PAGE_THROTTLE_DEBUG)
+      {
+        const ThrottleUiView_t previous_throttle_view = throttle_view;
+
+        if (UiTask_ReadThrottleView(&throttle_view))
+        {
+          refresh_start_tick = osKernelGetTickCount();
+          ThrottleUI_UpdateValues(&previous_throttle_view, &throttle_view);
+          refresh_duration = osKernelGetTickCount() - refresh_start_tick;
+          g_ui_last_refresh_time_ms = refresh_duration;
+          if (refresh_duration > g_ui_max_refresh_time_ms)
+          {
+            g_ui_max_refresh_time_ms = refresh_duration;
+          }
+        }
+      }
+
+      continue;
+    }
+
+    if (queue_status == osOK)
     {
       if (event_message.message_type == UI_EVENT_MESSAGE_INPUT)
       {
@@ -629,6 +656,24 @@ void StartUiTask(void *argument)
                 break;
 
               case MAIN_UI_FOCUS_THROTTLE:
+                /*
+                 * 当前油门页是ADC联调页面：进入时读取最近快照并整屏绘制，
+                 * 之后由UiTask每100 ms只刷新发生变化的四位数值区域。
+                 */
+                (void)UiTask_ReadThrottleView(&throttle_view);
+                current_page = UI_PAGE_THROTTLE_DEBUG;
+
+                refresh_start_tick = osKernelGetTickCount();
+                ThrottleUI_Draw(&throttle_view);
+                refresh_duration =
+                    osKernelGetTickCount() - refresh_start_tick;
+                g_ui_last_refresh_time_ms = refresh_duration;
+                if (refresh_duration > g_ui_max_refresh_time_ms)
+                {
+                  g_ui_max_refresh_time_ms = refresh_duration;
+                }
+                break;
+
               case MAIN_UI_FOCUS_SETTINGS:
               case MAIN_UI_FOCUS_STATUS:
               default:
@@ -688,6 +733,31 @@ void StartUiTask(void *argument)
              */
             refresh_start_tick = osKernelGetTickCount();
             MotorDirectionUI_Update(&previous_view, &view);
+            refresh_duration = osKernelGetTickCount() - refresh_start_tick;
+            g_ui_last_refresh_time_ms = refresh_duration;
+            if (refresh_duration > g_ui_max_refresh_time_ms)
+            {
+              g_ui_max_refresh_time_ms = refresh_duration;
+            }
+          }
+        }
+        else if (current_page == UI_PAGE_THROTTLE_DEBUG)
+        {
+          const UiInputEvent_t *const input = &event_message.data.input;
+
+          /*
+           * 临时联调页不执行油门业务，只接受BACK短按或长按返回主页面。
+           * 返回后焦点仍停在“油门”入口，便于反复进入观察ADC。
+           */
+          if ((input->key_id == KEY_ID_BACK) &&
+              ((input->action == UI_INPUT_ACTION_SHORT_PRESS) ||
+               (input->action == UI_INPUT_ACTION_LONG_PRESS)))
+          {
+            main_view.focus = MAIN_UI_FOCUS_THROTTLE;
+            current_page = UI_PAGE_MAIN;
+
+            refresh_start_tick = osKernelGetTickCount();
+            MainUI_Draw(&main_view);
             refresh_duration = osKernelGetTickCount() - refresh_start_tick;
             g_ui_last_refresh_time_ms = refresh_duration;
             if (refresh_duration > g_ui_max_refresh_time_ms)
@@ -899,6 +969,12 @@ void StartInputTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
+    /*
+     * ADC+DMA在后台连续采样；这里每10 ms只发布一次最新的两通道快照。
+     * 该操作不等待、不使用队列，也不会改变按键状态机的固定扫描周期。
+     */
+    Joystick_Process();
+
     const uint8_t event_count = KeyInput_Scan(
         key_events,
         (uint8_t)KEY_INPUT_MAX_EVENTS_PER_SCAN);
@@ -954,6 +1030,26 @@ void StartInputTask(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+/**
+ * @brief 将摇杆驱动快照转换为临时油门页面的数据模型。
+ *
+ * UiTask只通过此接口读取InputTask发布的数据，不直接读取DMA缓冲区，避免
+ * 显示层依赖ADC Rank和DMA数组布局。
+ */
+static bool UiTask_ReadThrottleView(ThrottleUiView_t *view)
+{
+  JoystickRawValues_t raw_values;
+
+  if ((view == NULL) || !Joystick_GetLatestRaw(&raw_values))
+  {
+    return false;
+  }
+
+  view->throttle_raw = raw_values.throttle_raw;
+  view->direction_raw = raw_values.direction_raw;
+  return true;
+}
 
 /**
  * @brief 把按键层事件转换为UI输入事件并 非阻塞地放入UiEventQueue。

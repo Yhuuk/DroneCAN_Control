@@ -28,6 +28,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "joystick.h"
 #include "lcd_init.h"
 
 /* USER CODE END Includes */
@@ -148,6 +149,15 @@ int main(void)
     HAL_Delay(10U);
   }
 #else
+
+  /*
+   * CubeMX只生成ADC/DMA底层配置；应用层在此完成ADC校准并启动双通道
+   * 循环DMA。若启动失败则停止进入业务，避免界面显示无效摇杆数据。
+   */
+  if (Joystick_Init() != HAL_OK)
+  {
+    Error_Handler();
+  }
 
   LCD_Init();
 

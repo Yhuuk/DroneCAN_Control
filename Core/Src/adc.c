@@ -38,6 +38,20 @@ void MX_ADC1_Init(void)
   ADC_ChannelConfTypeDef sConfig = {0};
 
   /* USER CODE BEGIN ADC1_Init 1 */
+  /**
+   * 当前ADC配置为:
+   * 12位分辨率。
+    右对齐。
+    扫描2个通道。
+    连续转换。
+    DMA连续请求。
+    DMA循环模式。
+    采样时间92.5周期。
+    DMA使用16位半字传输。
+
+    ADC时钟48MHz
+   */
+
 
   /* USER CODE END ADC1_Init 1 */
 
@@ -125,7 +139,7 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef* adcHandle)
     PA0     ------> ADC1_IN5
     PA1     ------> ADC1_IN6
     */
-    GPIO_InitStruct.Pin = Throttle_Pin|Direction_Pin;
+    GPIO_InitStruct.Pin = Direction_Pin|Throttle_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG_ADC_CONTROL;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
@@ -169,7 +183,7 @@ void HAL_ADC_MspDeInit(ADC_HandleTypeDef* adcHandle)
     PA0     ------> ADC1_IN5
     PA1     ------> ADC1_IN6
     */
-    HAL_GPIO_DeInit(GPIOA, Throttle_Pin|Direction_Pin);
+    HAL_GPIO_DeInit(GPIOA, Direction_Pin|Throttle_Pin);
 
     /* ADC1 DMA DeInit */
     HAL_DMA_DeInit(adcHandle->DMA_Handle);
