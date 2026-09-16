@@ -9,6 +9,10 @@
 #define DRONECAN_MEMORY_POOL_SIZE      2048U  //内存池大小
 #define DRONECAN_RX_FRAME_BUDGET          8U
 
+/* 8路命令各占14 bit；启用尾数组优化后编码结果固定为14字节。 */
+#define DRONECAN_RAW_COMMAND_PAYLOAD_SIZE \
+    ((DRONECAN_ESC_CHANNEL_COUNT * 14U + 7U) / 8U)
+
 static CanardInstance canard_instance;
 
 //使用uint32_t数组保证内存池至少4字节对齐,512 × 4 = 2048字节。
@@ -17,6 +21,12 @@ static uint32_t memory_pool[DRONECAN_MEMORY_POOL_SIZE / sizeof(uint32_t)];
 //DroneCAN Transfer-ID范围为0～31,ibcanard成功入队后会自动递增。
 static uint8_t g_direction_transfer_id = 0U; 
 static uint8_t g_direction_query_transfer_id = 0U;
+
+/*
+ * 每一种DroneCAN数据类型都维护自己的Transfer-ID序列。RawCommand不能与
+ * DirectionCommand共用该变量，否则两类消息交替发送时各自的序列会跳变。
+ */
+static uint8_t g_raw_command_transfer_id = 0U;
 
 //这个是 DirectionCommand自定义应用层的请求编号
 static uint16_t g_direction_request_id = 1U;
@@ -50,6 +60,74 @@ void DroneCAN_Node_Init(void){
     g_direction_query_response_available = false;
     g_last_rx_cleanup_usec = 0ULL;
 
+}
+
+int16_t DroneCAN_PublishRawCommand(
+    const DroneCANThrottleCommand_t *command)
+{
+    struct uavcan_equipment_esc_RawCommand raw_command = {0};
+    uint8_t payload[UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_MAX_SIZE] = {0};
+    CanardTxTransfer transfer = {0};
+    uint32_t payload_length;
+
+    if (command == NULL)
+    {
+        return -CANARD_ERROR_INVALID_ARGUMENT;
+    }
+
+    /*
+     * RawCommand用数组下标表达ESC通道，因此始终发送完整8路。不能把被掩码
+     * 选中的通道压缩到数组前部，否则接收端会把它们解释成错误的电机编号。
+     */
+    raw_command.cmd.len = DRONECAN_ESC_CHANNEL_COUNT;
+    for (uint8_t channel = 0U;
+         channel < DRONECAN_ESC_CHANNEL_COUNT;
+         ++channel)
+    {
+        /* uint16_t在类型上已排除负数，这里只需检查协议正向上限。 */
+        if (command->motor[channel] > DRONECAN_ESC_RAW_COMMAND_MAX)
+        {
+            /* 严格拒绝非法值，避免静默限幅掩盖上层油门计算错误。 */
+            return -CANARD_ERROR_INVALID_ARGUMENT;
+        }
+
+        raw_command.cmd.data[channel] =
+            (int16_t)command->motor[channel];
+    }
+
+    /*
+     * 生成代码负责把8个int14按DSDL位布局序列化到payload；应用代码不需要
+     * 手工移位、拼字节或计算多帧CRC。
+     */
+    payload_length =
+        uavcan_equipment_esc_RawCommand_encode(
+            &raw_command,
+            payload
+#if CANARD_ENABLE_TAO_OPTION
+            , true
+#endif
+        );
+    if (payload_length != DRONECAN_RAW_COMMAND_PAYLOAD_SIZE)
+    {
+        return -CANARD_ERROR_INTERNAL;
+    }
+
+    canardInitTxTransfer(&transfer);
+    transfer.transfer_type = CanardTransferTypeBroadcast;
+    transfer.data_type_signature = UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_SIGNATURE;
+    transfer.data_type_id = UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID;
+    transfer.inout_transfer_id = &g_raw_command_transfer_id;
+
+    /* 油门是实时控制量，优先级高于当前使用MEDIUM的配置/查询类消息。 */
+    transfer.priority = CANARD_TRANSFER_PRIORITY_HIGH;
+    transfer.payload = payload;
+    transfer.payload_len = (uint16_t)payload_length;
+
+    /*
+     * 此处只把libcanard拆分出的CAN帧放入软件发送队列。返回值大于0表示
+     * 入队成功；后续仍由DroneCAN_ProcessTx()逐帧送入HAL CAN发送邮箱。
+     */
+    return canardBroadcastObj(&canard_instance, &transfer);
 }
 
 

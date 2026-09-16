@@ -64,6 +64,15 @@ void MainUI_Draw(const MainUiView_t *view);
 void MainUI_UpdateFocus(const MainUiView_t *previous_view,
                         const MainUiView_t *current_view);
 
+/**
+ * @brief 仅刷新主页面的锁图标和底部油门条。
+ *
+ * 当全局油门锁或0~100油门输出变化时，UiTask调用本函数局部重画对应
+ * 区域，避免为一个状态变化重新发送整张240x120页面。
+ */
+void MainUI_UpdateThrottleStatus(const MainUiView_t *previous_view,
+                                 const MainUiView_t *current_view);
+
 #ifdef __cplusplus
 }
 #endif

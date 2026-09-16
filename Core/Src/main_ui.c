@@ -872,3 +872,39 @@ void MainUI_UpdateFocus(const MainUiView_t *previous_view,
         MainUI_DrawLogicalRegion(&current, left, top, right, bottom);
     }
 }
+
+void MainUI_UpdateThrottleStatus(const MainUiView_t *previous_view,
+                                 const MainUiView_t *current_view)
+{
+    MainUiView_t previous;
+    MainUiView_t current;
+
+    if ((previous_view == NULL) || (current_view == NULL))
+    {
+        MainUI_Draw(current_view);
+        return;
+    }
+
+    MainUI_ValidateView(previous_view, &previous);
+    MainUI_ValidateView(current_view, &current);
+
+    if (previous.throttle_unlocked != current.throttle_unlocked)
+    {
+        /*
+         * 开锁图标比闭锁图标更宽，因此按两种图标的并集重画，确保从
+         * 开锁切回闭锁时不会残留右侧锁梁像素。
+         */
+        MainUI_DrawLogicalRegion(
+            &current,
+            MAIN_UI_LOCK_ICON_X,
+            MAIN_UI_LOCK_ICON_Y,
+            MAIN_UI_LOCK_ICON_X + MAIN_UI_UNLOCKED_ICON_WIDTH - 1U,
+            MAIN_UI_LOCK_ICON_Y + MAIN_UI_LOCK_ICON_HEIGHT - 1U);
+    }
+
+    if (previous.throttle_percent != current.throttle_percent)
+    {
+        /* 只重画底部THR标签和进度条，不触碰四个入口及其焦点框。 */
+        MainUI_DrawLogicalRegion(&current, 0U, 95U, 125U, 119U);
+    }
+}

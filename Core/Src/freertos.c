@@ -33,6 +33,7 @@
 #include "key_input.h"
 #include "main_ui.h"
 #include "motor_direction_ui.h"
+#include "throttle_control.h"
 #include "throttle_ui.h"
 #include "ui_input_event.h"
 #include <dronecan_dshot.DirectionQuery.h>
@@ -132,6 +133,9 @@ typedef enum
 /** 临时油门调试页以10 Hz刷新数值，读数流畅且不会持续占用SPI总线。 */
 #define THROTTLE_UI_REFRESH_PERIOD_MS 100U
 
+/** 以100 Hz周期广播最新8路油门目标，与InputTask的10 ms快照周期一致。 */
+#define THROTTLE_RAW_COMMAND_PUBLISH_PERIOD_MS 10U
+
 /** 方向反馈LED每100 ms切换一次，形成清晰的快速闪烁。 */
 #define DIRECTION_LED_FLASH_HALF_PERIOD_MS 100U
 
@@ -227,6 +231,11 @@ volatile uint32_t g_can_tx_busy_count;
 volatile uint32_t g_can_tx_error_count;
 volatile uint32_t g_can_rx_error_count;
 volatile int16_t g_last_direction_enqueue_result;
+/** RawCommand发布调试量：最近值、最近入队结果以及成功/失败次数。 */
+volatile uint16_t g_last_throttle_raw_command;
+volatile int16_t g_last_throttle_enqueue_result;
+volatile uint32_t g_throttle_publish_count;
+volatile uint32_t g_throttle_publish_error_count;
 /** UiTask已经成功放入CanCommandQueue的方向命令数量。 */
 volatile uint32_t g_ui_direction_command_submitted_count;
 /** 因CanCommandQueue已满而未能提交的方向命令数量。 */
@@ -290,6 +299,7 @@ const osThreadAttr_t InputTask_attributes = {
 
 static void InputTask_PostUiEvent(const KeyEvent_t *key_event);
 static bool UiTask_ReadThrottleView(ThrottleUiView_t *view);
+static bool UiTask_UpdateMainThrottleView(MainUiView_t *view);
 static bool UiTask_HandleMainInput(MainUiView_t *view,
                                    const UiInputEvent_t *event);
 static void UiTask_PrepareDirectionPageEntry(MotorDirectionUiView_t *view);
@@ -383,6 +393,9 @@ void vApplicationMallocFailedHook(void)
   */
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
+
+  /* 在任何任务访问共享油门状态前，先明确置为锁定和零输出。 */
+  ThrottleControl_Init();
 
   /* USER CODE END Init */
 
@@ -532,7 +545,7 @@ void StartUiTask(void *argument)
       .node_id = DRONECAN_CONTROLLER_NODE_ID,
       .can_online = true,
       .throttle_unlocked = false,
-      .throttle_percent = 100U,
+      .throttle_percent = 0U,
       .focus = MAIN_UI_FOCUS_DIRECTION
   };
   UiPage_t current_page = UI_PAGE_MAIN;
@@ -575,9 +588,12 @@ void StartUiTask(void *argument)
 
   (void)argument;
 
+  /* 读取控制层的安全初值，确保主页面锁图标与实际输出状态一致。 */
+  (void)UiTask_UpdateMainThrottleView(&main_view);
+
   /*
-   * UiTask是调度器启动后唯一调用显示绘制函数的任务。开机首先绘制主页面；
-   * Node ID暂取固定配置126，CAN绿点和锁图标目前按设计稿使用静态状态。
+     * UiTask是调度器启动后唯一调用显示绘制函数的任务。开机首先绘制主页面；
+     * Node ID暂取固定配置126，锁图标和THR进度读取全局油门控制状态。
    */
   refresh_start_tick = osKernelGetTickCount();
   MainUI_Draw(&main_view);
@@ -589,21 +605,30 @@ void StartUiTask(void *argument)
   for(;;)
   {
     /*
-     * 普通页面没有周期显示需求，因此永久阻塞等待UI/CAN事件，不占CPU。
-     * 临时油门页需要显示实时ADC值，改为最多等待100 ms；超时只读取一次
-     * InputTask发布的快照并局部刷新数字，不会直接等待ADC转换。
+     * 主页面每100 ms局部刷新锁图标和油门条；临时油门页每100 ms刷新
+     * ADC值。方向页面没有周期显示需求，仍可永久阻塞等待事件。
      */
     queue_status = osMessageQueueGet(
         UiEventQueueHandle,
         &event_message,
         NULL,
-        (current_page == UI_PAGE_THROTTLE_DEBUG)
+        ((current_page == UI_PAGE_MAIN) ||
+         (current_page == UI_PAGE_THROTTLE_DEBUG))
             ? pdMS_TO_TICKS(THROTTLE_UI_REFRESH_PERIOD_MS)
             : osWaitForever);
 
     if (queue_status == osErrorTimeout)
     {
-      if (current_page == UI_PAGE_THROTTLE_DEBUG)
+      if (current_page == UI_PAGE_MAIN)
+      {
+        const MainUiView_t previous_main_view = main_view;
+
+        if (UiTask_UpdateMainThrottleView(&main_view))
+        {
+          MainUI_UpdateThrottleStatus(&previous_main_view, &main_view);
+        }
+      }
+      else if (current_page == UI_PAGE_THROTTLE_DEBUG)
       {
         const ThrottleUiView_t previous_throttle_view = throttle_view;
 
@@ -627,10 +652,29 @@ void StartUiTask(void *argument)
     {
       if (event_message.message_type == UI_EVENT_MESSAGE_INPUT)
       {
+        const UiInputEvent_t *const input = &event_message.data.input;
+
+        /*
+         * 面板SWITCH是全局油门安全开关，与当前显示页面无关。InputTask已
+         * 在长按800 ms成立时完成切换；这里消费通知并刷新显示，不再交给
+         * 各页面自己的按键状态机。
+         */
+        if ((input->key_id == KEY_ID_SWITCH) &&
+            (input->action == UI_INPUT_ACTION_LONG_PRESS))
+        {
+          const MainUiView_t previous_main_view = main_view;
+
+          /* InputTask已经及时完成状态切换；UiTask只同步显示，不重复切换。 */
+          if (UiTask_UpdateMainThrottleView(&main_view) &&
+              (current_page == UI_PAGE_MAIN))
+          {
+            MainUI_UpdateThrottleStatus(&previous_main_view, &main_view);
+          }
+          continue;
+        }
+
         if (current_page == UI_PAGE_MAIN)
         {
-          const UiInputEvent_t *const input = &event_message.data.input;
-
           if ((input->action == UI_INPUT_ACTION_SHORT_PRESS) &&
               (input->key_id == KEY_ID_CONFIRM))
           {
@@ -701,7 +745,6 @@ void StartUiTask(void *argument)
         }
         else if (current_page == UI_PAGE_MOTOR_DIRECTION)
         {
-          const UiInputEvent_t *const input = &event_message.data.input;
           const MotorDirectionUiView_t previous_view = view;
 
           if (UiTask_ShouldLeaveDirectionPage(&view, input))
@@ -712,6 +755,7 @@ void StartUiTask(void *argument)
              */
             main_view.focus = MAIN_UI_FOCUS_DIRECTION;
             current_page = UI_PAGE_MAIN;
+            (void)UiTask_UpdateMainThrottleView(&main_view);
 
             refresh_start_tick = osKernelGetTickCount();
             MainUI_Draw(&main_view);
@@ -743,8 +787,6 @@ void StartUiTask(void *argument)
         }
         else if (current_page == UI_PAGE_THROTTLE_DEBUG)
         {
-          const UiInputEvent_t *const input = &event_message.data.input;
-
           /*
            * 临时联调页不执行油门业务，只接受BACK短按或长按返回主页面。
            * 返回后焦点仍停在“油门”入口，便于反复进入观察ADC。
@@ -755,6 +797,7 @@ void StartUiTask(void *argument)
           {
             main_view.focus = MAIN_UI_FOCUS_THROTTLE;
             current_page = UI_PAGE_MAIN;
+            (void)UiTask_UpdateMainThrottleView(&main_view);
 
             refresh_start_tick = osKernelGetTickCount();
             MainUI_Draw(&main_view);
@@ -864,6 +907,12 @@ void StartCanTask(void *argument)
   HAL_StatusTypeDef status = HAL_OK;
   CanCommand_t command;
   CanCommandResult_t command_result;
+  DroneCANThrottleCommand_t throttle_command = {0};
+  ThrottleControlSnapshot_t throttle_snapshot = {
+      .unlocked = false,
+      .raw_command = 0U
+  };
+  uint32_t next_throttle_publish_tick;
   CanDirectionQueryControl_t query_control = {
       .active = false,
       .awaiting_response = false,
@@ -888,6 +937,7 @@ void StartCanTask(void *argument)
   }
 
   DroneCAN_Node_Init();
+  next_throttle_publish_tick = osKernelGetTickCount();
 
 
   /* Infinite loop */
@@ -920,6 +970,53 @@ void StartCanTask(void *argument)
     }
 
     CanTask_PollDirectionQuery(&query_control);
+
+    /*
+     * 油门是连续状态而不是离散命令，因此CanTask直接读取最新快照，每
+     * 10 ms构造一次完整8路RawCommand。不会经过普通命令队列，因而CAN
+     * 短暂繁忙时不会在FreeRTOS队列中积压已经过期的摇杆值。
+     */
+    const uint32_t now_tick = osKernelGetTickCount();
+    if ((int32_t)(now_tick - next_throttle_publish_tick) >= 0)
+    {
+      if (!ThrottleControl_GetSnapshot(&throttle_snapshot))
+      {
+        /* ADC快照异常时仍周期发送全零，不能沿用上一轮非零油门。 */
+        throttle_snapshot.unlocked = false;
+        throttle_snapshot.raw_command = 0U;
+      }
+
+      for (uint8_t channel = 0U;
+           channel < DRONECAN_ESC_CHANNEL_COUNT;
+           ++channel)
+      {
+        /* 当前联调阶段未启用掩码：8路电机使用同一个摇杆油门值。 */
+        throttle_command.motor[channel] = throttle_snapshot.raw_command;
+      }
+
+      g_last_throttle_raw_command = throttle_snapshot.raw_command;
+      g_last_throttle_enqueue_result =
+          DroneCAN_PublishRawCommand(&throttle_command);
+      if (g_last_throttle_enqueue_result > 0)
+      {
+        ++g_throttle_publish_count;
+      }
+      else
+      {
+        ++g_throttle_publish_error_count;
+      }
+
+      next_throttle_publish_tick +=
+          pdMS_TO_TICKS(THROTTLE_RAW_COMMAND_PUBLISH_PERIOD_MS);
+
+      /* 若任务曾被长时间延迟，跳过旧周期，避免恢复后连续补发过期油门。 */
+      if ((int32_t)(now_tick - next_throttle_publish_tick) >= 0)
+      {
+        next_throttle_publish_tick =
+            now_tick +
+            pdMS_TO_TICKS(THROTTLE_RAW_COMMAND_PUBLISH_PERIOD_MS);
+      }
+    }
 
     status = DroneCAN_ProcessTx();
     
@@ -1003,6 +1100,23 @@ void StartInputTask(void *argument)
 
       if (event->event_type == KEY_EVENT_LONG_PRESS)
       {
+        /*
+         * 油门SWITCH属于全局实时安全输入，不能等待低优先级UiTask完成
+         * 可能耗时的LCD刷新。InputTask在固定10 ms上下文中立即切换状态，
+         * 随后的UI事件只用于刷新锁图标，不再执行第二次切换。
+         */
+        if (event->key_id == KEY_ID_SWITCH)
+        {
+          if (ThrottleControl_IsUnlocked())
+          {
+            ThrottleControl_Lock();
+          }
+          else
+          {
+            (void)ThrottleControl_TryUnlock();
+          }
+        }
+
         g_key_long_press_count[event->key_id]++;
         InputTask_PostUiEvent(event);
         continue;
@@ -1050,6 +1164,36 @@ static bool UiTask_ReadThrottleView(ThrottleUiView_t *view)
   view->throttle_normalized = normalized_values.throttle_normalized;
   view->direction_normalized = normalized_values.direction_normalized;
   return true;
+}
+
+/**
+ * @brief 把全局油门控制快照同步到主页面显示模型。
+ * @return true表示锁状态或0~100油门值发生变化，需要局部刷新主页面。
+ *
+ * 主页面显示的是实际准备发送的RawCommand，而不是未经锁定判断的摇杆值；
+ * 因此锁定状态下即使拨动摇杆，底部THR仍保持0。
+ */
+static bool UiTask_UpdateMainThrottleView(MainUiView_t *view)
+{
+  ThrottleControlSnapshot_t snapshot = {
+      .unlocked = false,
+      .raw_command = 0U
+  };
+  bool changed;
+
+  if (view == NULL)
+  {
+    return false;
+  }
+
+  /* 摇杆快照无效时GetSnapshot会保留零输出，锁图标仍反映控制层状态。 */
+  (void)ThrottleControl_GetSnapshot(&snapshot);
+
+  changed = (view->throttle_unlocked != snapshot.unlocked) ||
+            (view->throttle_percent != (uint8_t)snapshot.raw_command);
+  view->throttle_unlocked = snapshot.unlocked;
+  view->throttle_percent = (uint8_t)snapshot.raw_command;
+  return changed;
 }
 
 /**

@@ -51,6 +51,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/dronecan_node.c
     Core/Src/key_input.c
     Core/Src/joystick.c
+    Core/Src/throttle_control.c
     Core/Src/main_ui.c
     Core/Src/motor_direction_ui.c
     Core/Src/throttle_ui.c

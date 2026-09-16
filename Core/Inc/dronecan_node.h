@@ -5,6 +5,31 @@
 #include <stdbool.h>
 #include "main.h"
 
+/** 本控制器当前实际管理的ESC通道数量。 */
+#define DRONECAN_ESC_CHANNEL_COUNT       8U
+
+/**
+ * RawCommand在DSDL中虽然使用有符号int14，但本控制器当前只使用正向油门。
+ * 因此传输边界只接受0~8191：0表示停转，8191表示协议允许的最大正向命令。
+ */
+#define DRONECAN_ESC_RAW_COMMAND_MIN     0U
+#define DRONECAN_ESC_RAW_COMMAND_MAX     8191U
+
+/**
+ * @brief 一次完整的8路ESC油门发布快照。
+ *
+ * motor[0]对应第1路电机，motor[7]对应第8路电机。这里故意不保存
+ * motor_mask：标准uavcan.equipment.esc.RawCommand没有掩码字段，后续业务层
+ * 应先依据本地掩码生成完整8路快照，再把该结构体交给CanTask发布。
+ *
+ * 使用uint16_t可以在应用层类型上排除负油门；发布函数还会逐项检查上限，
+ * 防止超出DSDL有符号int14的正向范围。
+ */
+typedef struct
+{
+    uint16_t motor[DRONECAN_ESC_CHANNEL_COUNT];
+} DroneCANThrottleCommand_t;
+
 /** DirectionQuery响应中与控制器业务有关的全部字段。 */
 typedef struct
 {
@@ -24,6 +49,20 @@ typedef struct
 } DroneCANDirectionQueryResponse_t;
 
 void DroneCAN_Node_Init(void);
+
+/**
+ * @brief 将一份完整的8路正向油门快照编码并加入libcanard发送队列。
+ *
+ * @param command 8路油门快照；每一路都必须处于0~8191。
+ * @return 大于0：成功加入libcanard的软件CAN帧数量；
+ *         0或负数：没有入队，错误值沿用libcanard约定。
+ *
+ * @note 本函数只完成DSDL编码和libcanard入队，不会直接调用HAL发送，也不会
+ *       自动周期发布。为保持CanardInstance单一所有权，只应由CanTask调用；
+ *       入队后的帧由CanTask持续调用DroneCAN_ProcessTx()送入CAN硬件邮箱。
+ */
+int16_t DroneCAN_PublishRawCommand(
+    const DroneCANThrottleCommand_t *command);
 
 int16_t DroneCAN_SetMotorDirection(
     uint8_t motor_mask,
