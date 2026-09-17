@@ -1,278 +1,780 @@
 #include "throttle_ui.h"
 
 #include "lcd_init.h"
+#include "throttle_ui_asset.h"
 
-#include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 
-/* 普通标签使用6x12字库，ADC数值单独放大一级为8x16。 */
+/* 用户画布与其它页面统一使用240x120横屏逻辑坐标。 */
+#define THROTTLE_UI_LOGICAL_WIDTH   240U
+#define THROTTLE_UI_LOGICAL_HEIGHT  120U
+
+#define THROTTLE_UI_SMALL_FONT_WIDTH   6U
+#define THROTTLE_UI_SMALL_FONT_HEIGHT 12U
+#define THROTTLE_UI_MEDIUM_FONT_WIDTH  8U
+#define THROTTLE_UI_MEDIUM_FONT_HEIGHT 16U
+#define THROTTLE_UI_LARGE_FONT_WIDTH  12U
+#define THROTTLE_UI_LARGE_FONT_HEIGHT 24U
+
+#define THROTTLE_UI_LOCK_X              211U
+#define THROTTLE_UI_LOCK_Y                0U
+#define THROTTLE_UI_LOCKED_WIDTH         18U
+#define THROTTLE_UI_UNLOCKED_WIDTH       27U
+#define THROTTLE_UI_LOCK_HEIGHT          23U
+
+/*
+ * 电机焦点框左右及上方扩大到5像素；下方保持4像素，避免第二排边框
+ * 与Y=96开始的THR区域相碰。较大圆角让边框转折更平滑。
+ */
+#define THROTTLE_UI_MOTOR_FOCUS_PADDING         5U
+#define THROTTLE_UI_MOTOR_FOCUS_BOTTOM_PADDING  4U
+#define THROTTLE_UI_MOTOR_FOCUS_RADIUS          7U
+#define THROTTLE_UI_MOTOR_FOCUS_BORDER_WIDTH    4U
+#define THROTTLE_UI_ALL_FOCUS_RADIUS             6U
+#define THROTTLE_UI_ALL_FOCUS_BORDER_WIDTH       3U
+#define THROTTLE_UI_TOP_FOCUS_BORDER_WIDTH      2U
+#define THROTTLE_UI_BAR_BORDER_WIDTH            2U
+
+#define THROTTLE_UI_COLOR_BACKGROUND  0x0F9EU /* SVG #0BF1F5 */
+#define THROTTLE_UI_COLOR_FOREGROUND  BLACK   /** #f800ba */
+#define THROTTLE_UI_COLOR_ALL_OFF     BLACK
+#define THROTTLE_UI_COLOR_ALL_ON      RED
+#define THROTTLE_UI_COLOR_PARAMETER   BLACK
+#define THROTTLE_UI_COLOR_TOP_FOCUS   YELLOW  /* 与主界面保持一致的导航焦点 */
+#define THROTTLE_UI_COLOR_MOTOR_FOCUS 0xF817  /** #f800ba ，区别于琥珀色选中背景 */
+#define THROTTLE_UI_COLOR_EDIT_FOCUS  WHITE
+#define THROTTLE_UI_COLOR_UNSELECTED  0xF7BEU /* 保留原图浅灰白背景 */
+#define THROTTLE_UI_COLOR_SELECTED    0xFED8 /* 浅桃色，避免与ALL绿色混淆 */
+#define THROTTLE_UI_COLOR_THROTTLE_TEXT    BLACK
+#define THROTTLE_UI_COLOR_THROTTLE_FILL  0xFA8BU
+
+/*
+ * 底部连续油门信息的两个独立刷新区域。进度条与精确数值分开后，UiTask
+ * 可以使用不同刷新频率，也不会为了更新其中一个而重复发送整个THR区域。
+ */
+#define THROTTLE_UI_BAR_LEFT          61U
+#define THROTTLE_UI_BAR_TOP          105U
+#define THROTTLE_UI_BAR_RIGHT        123U
+#define THROTTLE_UI_BAR_BOTTOM       112U
+#define THROTTLE_UI_RAW_VALUE_LEFT   128U
+#define THROTTLE_UI_RAW_VALUE_TOP    101U
+#define THROTTLE_UI_RAW_VALUE_RIGHT  159U
+#define THROTTLE_UI_RAW_VALUE_BOTTOM 116U
+
+#if defined(__GNUC__)
+#define THROTTLE_UI_MAYBE_UNUSED __attribute__((unused))
+#else
+#define THROTTLE_UI_MAYBE_UNUSED
+#endif
+
 extern const unsigned char ascii_1206[][12];
 extern const unsigned char ascii_1608[][16];
+extern const unsigned char ascii_2412[][48];
 
-/* LCD 物理安装方向为 120x240，UI 使用更直观的横屏逻辑坐标 240x120。 */
-#define THROTTLE_UI_LOGICAL_WIDTH       240U
-#define THROTTLE_UI_LOGICAL_HEIGHT      120U
+static const uint16_t g_motor_icon_x[8U] =
+    {24U, 79U, 133U, 188U, 24U, 79U, 134U, 188U};
+static const uint16_t g_motor_icon_y[8U] =
+    {29U, 29U, 29U, 29U, 66U, 66U, 66U, 66U};
 
-#define THROTTLE_UI_FONT_WIDTH          6U
-#define THROTTLE_UI_FONT_HEIGHT         12U
-#define THROTTLE_UI_VALUE_FONT_WIDTH    8U
-#define THROTTLE_UI_VALUE_FONT_HEIGHT   16U
+/* 与主页面使用完全相同的1.5倍锁图标点阵。 */
+static const uint8_t g_throttle_ui_unlocked_icon[92U] = {
+    0x00U, 0x00U, 0x7EU, 0x00U, 0x00U, 0x00U, 0xFFU, 0x00U,
+    0x00U, 0x80U, 0xC3U, 0x01U, 0x00U, 0xC0U, 0x81U, 0x03U,
+    0x00U, 0xC0U, 0x00U, 0x03U, 0x00U, 0xE0U, 0x00U, 0x07U,
+    0x00U, 0xE0U, 0x00U, 0x07U, 0x00U, 0xE0U, 0x00U, 0x07U,
+    0x00U, 0xE0U, 0x00U, 0x07U, 0xFCU, 0xFFU, 0x00U, 0x00U,
+    0xFFU, 0xFFU, 0x03U, 0x00U, 0x03U, 0x00U, 0x03U, 0x00U,
+    0x03U, 0x00U, 0x03U, 0x00U, 0x03U, 0x03U, 0x03U, 0x00U,
+    0x83U, 0x07U, 0x03U, 0x00U, 0x83U, 0x07U, 0x03U, 0x00U,
+    0x03U, 0x03U, 0x03U, 0x00U, 0x03U, 0x03U, 0x03U, 0x00U,
+    0x83U, 0x07U, 0x03U, 0x00U, 0x03U, 0x03U, 0x03U, 0x00U,
+    0x03U, 0x00U, 0x03U, 0x00U, 0xFFU, 0xFFU, 0x03U, 0x00U,
+    0xFEU, 0xFFU, 0x01U, 0x00U
+};
 
-#define THROTTLE_UI_COLOR_BACKGROUND    0x1D79U
-#define THROTTLE_UI_COLOR_BORDER        0xFFFFU
-#define THROTTLE_UI_COLOR_TITLE         0xFFFFU
-#define THROTTLE_UI_COLOR_LABEL         0xBDF7U
-#define THROTTLE_UI_COLOR_VALUE         0x07E0U
-#define THROTTLE_UI_COLOR_HINT          0x7BEFU
-#define THROTTLE_UI_COLOR_DIVIDER       0x4A69U
+static const uint8_t g_throttle_ui_locked_icon[69U] = {
+    0xC0U, 0x0FU, 0x00U, 0xE0U, 0x1FU, 0x00U, 0x70U, 0x38U, 0x00U,
+    0x38U, 0x70U, 0x00U, 0x18U, 0x60U, 0x00U, 0x1CU, 0xE0U, 0x00U,
+    0x1CU, 0xE0U, 0x00U, 0x1CU, 0xE0U, 0x00U, 0x1CU, 0xE0U, 0x00U,
+    0xFEU, 0xFFU, 0x01U, 0xFFU, 0xFFU, 0x03U, 0x03U, 0x00U, 0x03U,
+    0x03U, 0x00U, 0x03U, 0x03U, 0x03U, 0x03U, 0x83U, 0x07U, 0x03U,
+    0x83U, 0x07U, 0x03U, 0x83U, 0x07U, 0x03U, 0x03U, 0x03U, 0x03U,
+    0x83U, 0x07U, 0x03U, 0x83U, 0x07U, 0x03U, 0x03U, 0x00U, 0x03U,
+    0xFFU, 0xFFU, 0x03U, 0xFEU, 0xFFU, 0x01U
+};
 
-/* 两个固定宽度数值的逻辑坐标，用于后续局部刷新。 */
-#define THROTTLE_UI_LEFT_VALUE_X        58U
-#define THROTTLE_UI_RIGHT_VALUE_X       178U
-#define THROTTLE_UI_VALUE_LABEL_Y       61U
-#define THROTTLE_UI_VALUE_Y             59U
-
-/* 每个RGB565像素按屏幕要求存成“高字节、低字节”。 */
 static uint8_t g_throttle_ui_line_buffer[LCD_W * 2U];
 
-static bool ThrottleUI_TextPixel(uint16_t x,
-                                 uint16_t y,
-                                 uint16_t text_x,
-                                 uint16_t text_y,
-                                 const char *text,
-                                 uint16_t text_length)
+#if (LCD_W != 120U) || (LCD_H != 240U)
+#error "ThrottleUI software rotation expects a 120x240 LCD framebuffer"
+#endif
+
+static bool ThrottleUI_PointInRectangle(uint16_t x,
+                                        uint16_t y,
+                                        uint16_t left,
+                                        uint16_t top,
+                                        uint16_t right,
+                                        uint16_t bottom)
 {
-    uint16_t character_index;
-    uint16_t local_x;
-    uint16_t local_y;
-    unsigned char character;
-
-    if ((text == NULL) || (text_length == 0U) ||
-        (x < text_x) || (y < text_y))
-    {
-        return false;
-    }
-
-    local_y = (uint16_t)(y - text_y);
-    if (local_y >= THROTTLE_UI_FONT_HEIGHT)
-    {
-        return false;
-    }
-
-    character_index = (uint16_t)((x - text_x) / THROTTLE_UI_FONT_WIDTH);
-    if (character_index >= text_length)
-    {
-        return false;
-    }
-
-    local_x = (uint16_t)((x - text_x) % THROTTLE_UI_FONT_WIDTH);
-    character = (unsigned char)text[character_index];
-
-    if ((character == '\0') || (character < ' ') || (character > '~'))
-    {
-        return false;
-    }
-
-    return ((ascii_1206[character - ' '][local_y] >> local_x) & 0x01U) != 0U;
+    return (x >= left) && (x <= right) && (y >= top) && (y <= bottom);
 }
 
-/**
- * @brief 判断像素是否属于8x16的大号ADC数值。
- *
- * 只给两个五位带符号校准值使用更大的字库，页面标题、标签和返回提示仍保持
- * 6x12，既增强读数可见性，也不会挤压左右两栏的固定布局。
- */
-static bool ThrottleUI_ValueTextPixel(uint16_t x,
-                                      uint16_t y,
-                                      uint16_t text_x,
-                                      uint16_t text_y,
-                                      const char text[6])
+static bool ThrottleUI_PointInCircle(uint16_t x,
+                                     uint16_t y,
+                                     uint16_t center_x,
+                                     uint16_t center_y,
+                                     uint16_t radius)
 {
-    uint16_t character_index;
+    const int32_t dx = (int32_t)x - (int32_t)center_x;
+    const int32_t dy = (int32_t)y - (int32_t)center_y;
+
+    return ((dx * dx) + (dy * dy)) <=
+           ((int32_t)radius * (int32_t)radius);
+}
+
+static bool ThrottleUI_PointInRoundedRectangle(uint16_t x,
+                                               uint16_t y,
+                                               uint16_t left,
+                                               uint16_t top,
+                                               uint16_t right,
+                                               uint16_t bottom,
+                                               uint16_t radius)
+{
+    if (!ThrottleUI_PointInRectangle(x, y, left, top, right, bottom))
+    {
+        return false;
+    }
+
+    if (((x >= (left + radius)) && (x <= (right - radius))) ||
+        ((y >= (top + radius)) && (y <= (bottom - radius))))
+    {
+        return true;
+    }
+
+    return ThrottleUI_PointInCircle(x, y, left + radius, top + radius, radius) ||
+           ThrottleUI_PointInCircle(x, y, right - radius, top + radius, radius) ||
+           ThrottleUI_PointInCircle(x, y, left + radius, bottom - radius, radius) ||
+           ThrottleUI_PointInCircle(x, y, right - radius, bottom - radius, radius);
+}
+
+/** @brief 按给定线宽生成圆角边框像素。 */
+static bool ThrottleUI_PointOnRoundedBorder(uint16_t x,
+                                            uint16_t y,
+                                            uint16_t left,
+                                            uint16_t top,
+                                            uint16_t right,
+                                            uint16_t bottom,
+                                            uint16_t radius,
+                                            uint16_t border_width)
+{
+    if (border_width == 0U)
+    {
+        return false;
+    }
+
+    if (!ThrottleUI_PointInRoundedRectangle(
+            x, y, left, top, right, bottom, radius))
+    {
+        return false;
+    }
+
+    if ((right - left < (2U * border_width)) ||
+        (bottom - top < (2U * border_width)) ||
+        (radius < border_width))
+    {
+        return true;
+    }
+
+    return !ThrottleUI_PointInRoundedRectangle(
+        x, y,
+        left + border_width,
+        top + border_width,
+        right - border_width,
+        bottom - border_width,
+        radius - border_width);
+}
+
+static bool THROTTLE_UI_MAYBE_UNUSED
+ThrottleUI_SmallTextPixel(uint16_t x,
+                          uint16_t y,
+                          uint16_t text_x,
+                          uint16_t text_y,
+                          const char *text)
+{
     uint16_t local_x;
     uint16_t local_y;
-    unsigned char character;
+    uint16_t character_index;
+    uint8_t character;
 
     if ((text == NULL) || (x < text_x) || (y < text_y))
     {
         return false;
     }
 
-    local_x = (uint16_t)(x - text_x);
-    local_y = (uint16_t)(y - text_y);
-    if (local_y >= THROTTLE_UI_VALUE_FONT_HEIGHT)
+    local_x = x - text_x;
+    local_y = y - text_y;
+    if (local_y >= THROTTLE_UI_SMALL_FONT_HEIGHT)
     {
         return false;
     }
 
-    character_index =
-        (uint16_t)(local_x / THROTTLE_UI_VALUE_FONT_WIDTH);
-    if (character_index >= 5U)
+    character_index = local_x / THROTTLE_UI_SMALL_FONT_WIDTH;
+    if ((size_t)character_index >= strlen(text))
     {
         return false;
     }
 
-    local_x = (uint16_t)(local_x % THROTTLE_UI_VALUE_FONT_WIDTH);
-    character = (unsigned char)text[character_index];
-    if ((character < ' ') || (character > '~'))
+    local_x %= THROTTLE_UI_SMALL_FONT_WIDTH;
+    character = (uint8_t)text[character_index];
+    if ((character < (uint8_t)' ') || (character > (uint8_t)'~'))
     {
         return false;
     }
 
-    return ((ascii_1608[character - ' '][local_y] >> local_x) & 0x01U) != 0U;
+    return ((ascii_1206[character - (uint8_t)' '][local_y] >> local_x) &
+            0x01U) != 0U;
 }
 
 /**
- * @brief 将-1000~+1000格式化为固定五位带符号十进制字符。
+ * @brief 判断指定像素是否属于8x16 ASCII字符串的前景。
  *
- * 正数显示“+”，负数显示“-”，零显示前导空格。固定宽度可确保局部刷新
- * 时新数字完全覆盖旧数字，例如-1000变为+0007时不会留下旧像素。
+ * @note 保留独立的6x12解析函数，便于较小区域后续继续使用；当前油门页的
+ *       参数标签和值临时统一使用本函数，以便直接对比两种字号的实际效果。
  */
-static void ThrottleUI_FormatNormalizedValue(int16_t value, char text[6])
+static bool ThrottleUI_MediumTextPixel(uint16_t x,
+                                       uint16_t y,
+                                       uint16_t text_x,
+                                       uint16_t text_y,
+                                       const char *text)
 {
-    uint16_t magnitude;
+    uint16_t local_x;
+    uint16_t local_y;
+    uint16_t character_index;
+    uint8_t character;
 
-    if (value < -1000)
+    if ((text == NULL) || (x < text_x) || (y < text_y))
     {
-        value = -1000;
-    }
-    else if (value > 1000)
-    {
-        value = 1000;
+        return false;
     }
 
-    text[0] = (value < 0) ? '-' : ((value > 0) ? '+' : ' ');
-    magnitude = (value < 0) ? (uint16_t)(-value) : (uint16_t)value;
-    text[1] = (char)('0' + ((magnitude / 1000U) % 10U));
-    text[2] = (char)('0' + ((magnitude / 100U) % 10U));
-    text[3] = (char)('0' + ((magnitude / 10U) % 10U));
-    text[4] = (char)('0' + (magnitude % 10U));
-    text[5] = '\0';
+    local_x = x - text_x;
+    local_y = y - text_y;
+    if (local_y >= THROTTLE_UI_MEDIUM_FONT_HEIGHT)
+    {
+        return false;
+    }
+
+    character_index = local_x / THROTTLE_UI_MEDIUM_FONT_WIDTH;
+    if ((size_t)character_index >= strlen(text))
+    {
+        return false;
+    }
+
+    local_x %= THROTTLE_UI_MEDIUM_FONT_WIDTH;
+    character = (uint8_t)text[character_index];
+    if ((character < (uint8_t)' ') || (character > (uint8_t)'~'))
+    {
+        return false;
+    }
+
+    return ((ascii_1608[character - (uint8_t)' '][local_y] >> local_x) &
+            0x01U) != 0U;
+}
+
+static bool ThrottleUI_LargeTextPixel(uint16_t x,
+                                      uint16_t y,
+                                      uint16_t text_x,
+                                      uint16_t text_y,
+                                      const char *text)
+{
+    uint16_t local_x;
+    uint16_t local_y;
+    uint16_t character_index;
+    uint16_t byte_index;
+    uint8_t character;
+
+    if ((text == NULL) || (x < text_x) || (y < text_y))
+    {
+        return false;
+    }
+
+    local_x = x - text_x;
+    local_y = y - text_y;
+    if (local_y >= THROTTLE_UI_LARGE_FONT_HEIGHT)
+    {
+        return false;
+    }
+
+    character_index = local_x / THROTTLE_UI_LARGE_FONT_WIDTH;
+    if ((size_t)character_index >= strlen(text))
+    {
+        return false;
+    }
+
+    local_x %= THROTTLE_UI_LARGE_FONT_WIDTH;
+    byte_index = (local_y * 2U) + (local_x / 8U);
+    character = (uint8_t)text[character_index];
+    if ((character < (uint8_t)' ') || (character > (uint8_t)'~'))
+    {
+        return false;
+    }
+
+    return (ascii_2412[character - (uint8_t)' '][byte_index] &
+            (uint8_t)(1U << (local_x % 8U))) != 0U;
+}
+
+/**
+ * @brief 在12x24字模基础上向右扩展1像素，生成更醒目的粗体效果。
+ *
+ * 仅ALL状态标签使用本函数；THR等其它12x24文字仍保持原始字重。
+ */
+static bool ThrottleUI_LargeBoldTextPixel(uint16_t x,
+                                          uint16_t y,
+                                          uint16_t text_x,
+                                          uint16_t text_y,
+                                          const char *text)
+{
+    if (ThrottleUI_LargeTextPixel(x, y, text_x, text_y, text))
+    {
+        return true;
+    }
+
+    return (x > text_x) &&
+           ThrottleUI_LargeTextPixel(x - 1U, y, text_x, text_y, text);
+}
+
+static bool ThrottleUI_BitmapPixel(uint16_t x,
+                                   uint16_t y,
+                                   uint16_t left,
+                                   uint16_t top,
+                                   uint16_t width,
+                                   uint16_t height,
+                                   uint16_t bytes_per_row,
+                                   const uint8_t *bitmap)
+{
+    uint16_t local_x;
+    uint16_t local_y;
+
+    if ((bitmap == NULL) || (x < left) || (y < top))
+    {
+        return false;
+    }
+
+    local_x = x - left;
+    local_y = y - top;
+    if ((local_x >= width) || (local_y >= height))
+    {
+        return false;
+    }
+
+    return (bitmap[(local_y * bytes_per_row) + (local_x / 8U)] &
+            (uint8_t)(1U << (local_x % 8U))) != 0U;
+}
+
+static void ThrottleUI_FormatUint16(uint16_t value, char text[5])
+{
+    uint16_t divisor = 1000U;
+    uint8_t index = 0U;
+    bool started = false;
+
+    while (divisor > 0U)
+    {
+        const uint8_t digit = (uint8_t)(value / divisor);
+
+        if ((digit != 0U) || started || (divisor == 1U))
+        {
+            text[index++] = (char)('0' + digit);
+            started = true;
+        }
+        value %= divisor;
+        divisor /= 10U;
+    }
+    text[index] = '\0';
+}
+
+static void ThrottleUI_FormatMask(uint8_t mask, char text[3])
+{
+    static const char hex_digits[] = "0123456789ABCDEF";
+
+    text[0] = hex_digits[(mask >> 4U) & 0x0FU];
+    text[1] = hex_digits[mask & 0x0FU];
+    text[2] = '\0';
+}
+
+/**
+ * @brief 返回无符号十进制数实际需要显示的字符数量。
+ *
+ * 数值0也需要一个字符，因此本函数最小返回1。LIM和STEP的焦点框使用
+ * 此结果计算右边界，使不同位数始终保持与三位数状态相同的右侧留白。
+ */
+static uint8_t ThrottleUI_GetUint16DigitCount(uint16_t value)
+{
+    uint8_t digit_count = 1U;
+
+    while (value >= 10U)
+    {
+        value /= 10U;
+        ++digit_count;
+    }
+
+    return digit_count;
+}
+
+static void ThrottleUI_ValidateView(const ThrottleUiView_t *source,
+                                    ThrottleUiView_t *destination)
+{
+    if (destination == NULL)
+    {
+        return;
+    }
+
+    if (source == NULL)
+    {
+        memset(destination, 0, sizeof(*destination));
+        destination->limit = 100U;
+        destination->step = 100U;
+        destination->focus = THROTTLE_UI_FOCUS_ALL;
+        return;
+    }
+
+    *destination = *source;
+    if (destination->limit > 8191U)
+    {
+        destination->limit = 8191U;
+    }
+    if (destination->raw_command > destination->limit)
+    {
+        destination->raw_command = destination->limit;
+    }
+    if (destination->throttle_percent > 100U)
+    {
+        destination->throttle_percent = 100U;
+    }
+    if ((destination->step != 1U) && (destination->step != 10U) &&
+        (destination->step != 100U) && (destination->step != 1000U))
+    {
+        destination->step = 100U;
+    }
+    if (destination->focus > THROTTLE_UI_FOCUS_MOTOR_8)
+    {
+        destination->focus = THROTTLE_UI_FOCUS_ALL;
+    }
+    if ((destination->focus != THROTTLE_UI_FOCUS_LIMIT) &&
+        (destination->focus != THROTTLE_UI_FOCUS_STEP))
+    {
+        destination->edit_mode = false;
+    }
+}
+
+static bool ThrottleUI_GetFocusBounds(ThrottleUiFocus_t focus,
+                                      const ThrottleUiView_t *view,
+                                      uint16_t *left,
+                                      uint16_t *top,
+                                      uint16_t *right,
+                                      uint16_t *bottom)
+{
+    uint8_t motor_index;
+
+    if ((left == NULL) || (top == NULL) ||
+        (right == NULL) || (bottom == NULL))
+    {
+        return false;
+    }
+
+    switch (focus)
+    {
+        case THROTTLE_UI_FOCUS_ALL:
+            *left = 0U; *top = 0U; *right = 42U; *bottom = 26U;
+            return true;
+        case THROTTLE_UI_FOCUS_LIMIT:
+            *left = 40U;
+            *top = 3U;
+            *right = (uint16_t)(82U +
+                ((uint16_t)ThrottleUI_GetUint16DigitCount(
+                    (view != NULL) ? view->limit : 100U) *
+                 THROTTLE_UI_MEDIUM_FONT_WIDTH));
+            *bottom = 22U;
+            return true;
+        case THROTTLE_UI_FOCUS_STEP:
+            *left = 110U;
+            *top = 3U;
+            *right = (uint16_t)(166U +
+                ((uint16_t)ThrottleUI_GetUint16DigitCount(
+                    (view != NULL) ? view->step : 100U) *
+                 THROTTLE_UI_MEDIUM_FONT_WIDTH));
+            *bottom = 22U;
+            return true;
+        default:
+            break;
+    }
+
+    if ((focus < THROTTLE_UI_FOCUS_MOTOR_1) ||
+        (focus > THROTTLE_UI_FOCUS_MOTOR_8))
+    {
+        return false;
+    }
+
+    motor_index = (uint8_t)(focus - THROTTLE_UI_FOCUS_MOTOR_1);
+    *left = g_motor_icon_x[motor_index] -
+            THROTTLE_UI_MOTOR_FOCUS_PADDING;
+    *top = g_motor_icon_y[motor_index] -
+           THROTTLE_UI_MOTOR_FOCUS_PADDING;
+    *right = g_motor_icon_x[motor_index] +
+             THROTTLE_UI_MOTOR_ICON_WIDTH +
+             THROTTLE_UI_MOTOR_FOCUS_PADDING - 1U;
+    *bottom = g_motor_icon_y[motor_index] +
+              THROTTLE_UI_MOTOR_ICON_HEIGHT +
+              THROTTLE_UI_MOTOR_FOCUS_BOTTOM_PADDING - 1U;
+    return true;
+}
+
+static bool ThrottleUI_FocusPixel(uint16_t x,
+                                  uint16_t y,
+                                  const ThrottleUiView_t *view)
+{
+    uint16_t left;
+    uint16_t top;
+    uint16_t right;
+    uint16_t bottom;
+    uint16_t radius = 4U;
+    uint16_t border_width = THROTTLE_UI_TOP_FOCUS_BORDER_WIDTH;
+
+    if (!ThrottleUI_GetFocusBounds(
+            view->focus, view, &left, &top, &right, &bottom))
+    {
+        return false;
+    }
+
+    if (view->focus >= THROTTLE_UI_FOCUS_MOTOR_1)
+    {
+        radius = THROTTLE_UI_MOTOR_FOCUS_RADIUS;
+        border_width = THROTTLE_UI_MOTOR_FOCUS_BORDER_WIDTH;
+    }
+    else if (view->focus == THROTTLE_UI_FOCUS_ALL)
+    {
+        radius = THROTTLE_UI_ALL_FOCUS_RADIUS;
+        border_width = THROTTLE_UI_ALL_FOCUS_BORDER_WIDTH;
+    }
+
+    return ThrottleUI_PointOnRoundedBorder(
+        x, y, left, top, right, bottom, radius, border_width);
+}
+
+/**
+ * @brief 用原稿灰度轮廓在指定背景上合成电机图标。
+ *
+ * 这样通道选中时只替换浅色背景为琥珀色，齿轮、数字和抗锯齿边缘仍来自
+ * 原SVG图标，不会因为状态变化重新用几何图形近似。
+ */
+static bool ThrottleUI_GetMotorIconPixel(uint16_t x,
+                                         uint16_t y,
+                                         const ThrottleUiView_t *view,
+                                         uint16_t *color)
+{
+    for (uint8_t index = 0U; index < 8U; ++index)
+    {
+        if ((x >= g_motor_icon_x[index]) &&
+            (x < (g_motor_icon_x[index] + THROTTLE_UI_MOTOR_ICON_WIDTH)) &&
+            (y >= g_motor_icon_y[index]) &&
+            (y < (g_motor_icon_y[index] + THROTTLE_UI_MOTOR_ICON_HEIGHT)))
+        {
+            const uint16_t local_x = x - g_motor_icon_x[index];
+            const uint16_t local_y = y - g_motor_icon_y[index];
+            const uint8_t gray =
+                g_throttle_ui_motor_icon_gray[index]
+                    [(local_y * THROTTLE_UI_MOTOR_ICON_WIDTH) + local_x];
+            const uint16_t background =
+                ((view->motor_mask & (uint8_t)(1UL << index)) != 0U)
+                    ? THROTTLE_UI_COLOR_SELECTED
+                    : THROTTLE_UI_COLOR_UNSELECTED;
+            const uint16_t red =
+                (uint16_t)((((background >> 11U) & 0x1FU) * gray) / 255U);
+            const uint16_t green =
+                (uint16_t)((((background >> 5U) & 0x3FU) * gray) / 255U);
+            const uint16_t blue =
+                (uint16_t)(((background & 0x1FU) * gray) / 255U);
+
+            *color = (uint16_t)((red << 11U) | (green << 5U) | blue);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ThrottleUI_LockPixel(uint16_t x,
+                                 uint16_t y,
+                                 bool unlocked)
+{
+    if (unlocked)
+    {
+        return ThrottleUI_BitmapPixel(x, y,
+                                      THROTTLE_UI_LOCK_X,
+                                      THROTTLE_UI_LOCK_Y,
+                                      THROTTLE_UI_UNLOCKED_WIDTH,
+                                      THROTTLE_UI_LOCK_HEIGHT,
+                                      4U,
+                                      g_throttle_ui_unlocked_icon);
+    }
+
+    return ThrottleUI_BitmapPixel(x, y,
+                                  THROTTLE_UI_LOCK_X,
+                                  THROTTLE_UI_LOCK_Y,
+                                  THROTTLE_UI_LOCKED_WIDTH,
+                                  THROTTLE_UI_LOCK_HEIGHT,
+                                  3U,
+                                  g_throttle_ui_locked_icon);
 }
 
 static uint16_t ThrottleUI_GetLogicalPixel(uint16_t x,
                                            uint16_t y,
-                                           const char throttle_text[6],
-                                           const char direction_text[6])
+                                           const ThrottleUiView_t *view,
+                                           const char *limit_text,
+                                           const char *step_text,
+                                           const char *raw_text,
+                                           const char *mask_text)
 {
     uint16_t color = THROTTLE_UI_COLOR_BACKGROUND;
+    uint16_t motor_color;
+    const uint16_t fill_width =
+        (uint16_t)(((uint32_t)(THROTTLE_UI_BAR_RIGHT -
+                               THROTTLE_UI_BAR_LEFT - 1U) *
+                    view->throttle_percent) / 100U);
 
-    /* 外框与两轴分区线。 */
-    if ((x == 0U) || (x == (THROTTLE_UI_LOGICAL_WIDTH - 1U)) ||
-        (y == 0U) || (y == (THROTTLE_UI_LOGICAL_HEIGHT - 1U)))
+    if (ThrottleUI_FocusPixel(x, y, view))
     {
-        color = THROTTLE_UI_COLOR_BORDER;
-    }
-    if ((y == 27U) || (y == 95U) ||
-        (((x == 119U) || (x == 120U)) && (y >= 28U) && (y < 95U)))
-    {
-        color = THROTTLE_UI_COLOR_DIVIDER;
+        if (view->edit_mode)
+        {
+            color = THROTTLE_UI_COLOR_EDIT_FOCUS;
+        }
+        else if (view->focus >= THROTTLE_UI_FOCUS_MOTOR_1)
+        {
+            color = THROTTLE_UI_COLOR_MOTOR_FOCUS;
+        }
+        else
+        {
+            color = THROTTLE_UI_COLOR_TOP_FOCUS;
+        }
     }
 
-    if (ThrottleUI_TextPixel(x, y, 93U, 8U, "ADC DEBUG", 9U))
+    if (ThrottleUI_GetMotorIconPixel(x, y, view, &motor_color))
     {
-        color = THROTTLE_UI_COLOR_TITLE;
+        color = motor_color;
     }
-    else if (ThrottleUI_TextPixel(x, y, 36U, 38U, "THROTTLE", 8U) ||
-             ThrottleUI_TextPixel(x, y, 153U, 38U, "DIRECTION", 9U) ||
-             ThrottleUI_TextPixel(x,
-                                  y,
-                                  30U,
-                                  THROTTLE_UI_VALUE_LABEL_Y,
-                                  "CAL:",
-                                  4U) ||
-             ThrottleUI_TextPixel(x,
-                                  y,
-                                  150U,
-                                  THROTTLE_UI_VALUE_LABEL_Y,
-                                  "CAL:",
-                                  4U))
+
+    if (ThrottleUI_LargeBoldTextPixel(x, y, 2U, 0U, "ALL"))
     {
-        color = THROTTLE_UI_COLOR_LABEL;
+        color = (view->motor_mask == 0xFFU)
+                    ? THROTTLE_UI_COLOR_ALL_ON
+                    : THROTTLE_UI_COLOR_ALL_OFF;
     }
-    else if (ThrottleUI_ValueTextPixel(x,
-                                       y,
-                                       THROTTLE_UI_LEFT_VALUE_X,
-                                       THROTTLE_UI_VALUE_Y,
-                                       throttle_text) ||
-             ThrottleUI_ValueTextPixel(x,
-                                       y,
-                                       THROTTLE_UI_RIGHT_VALUE_X,
-                                       THROTTLE_UI_VALUE_Y,
-                                       direction_text))
+    else if (ThrottleUI_MediumTextPixel(x, y, 45U, 4U, "LIM:") ||
+             ThrottleUI_MediumTextPixel(x, y, 78U, 4U, limit_text) ||
+             ThrottleUI_MediumTextPixel(x, y, 115U, 4U, "STEP:") ||
+             ThrottleUI_MediumTextPixel(x, y, 163U, 4U, step_text))
     {
-        color = THROTTLE_UI_COLOR_VALUE;
+        color = THROTTLE_UI_COLOR_PARAMETER;
     }
-    else if (ThrottleUI_TextPixel(x,
-                                  y,
-                                  78U,
-                                  81U,
-                                  "CAL -1000~1000",
-                                  14U) ||
-             ThrottleUI_TextPixel(x,
-                                  y,
-                                  84U,
-                                  103U,
-                                  "BACK: RETURN",
-                                  12U))
+
+    /* 在STEP标签和值之间绘制一个紧凑的±符号。 */
+    if ((((x >= 156U) && (x <= 161U)) && (y == 10U)) ||
+        ((x == 158U) && (y >= 8U) && (y <= 12U)) ||
+        (((x >= 156U) && (x <= 161U)) && (y == 15U)))
     {
-        color = THROTTLE_UI_COLOR_HINT;
+        color = THROTTLE_UI_COLOR_PARAMETER;
+    }
+
+    if (ThrottleUI_LockPixel(x, y, view->throttle_unlocked))
+    {
+        color = THROTTLE_UI_COLOR_FOREGROUND;
+    }
+
+    if (ThrottleUI_LargeTextPixel(x, y, 7U, 96U, "THR:"))
+    {
+        color = THROTTLE_UI_COLOR_THROTTLE_TEXT;
+    }
+
+    if (ThrottleUI_PointOnRoundedBorder(
+            x, y,
+            THROTTLE_UI_BAR_LEFT,
+            THROTTLE_UI_BAR_TOP,
+            THROTTLE_UI_BAR_RIGHT,
+            THROTTLE_UI_BAR_BOTTOM,
+            3U, THROTTLE_UI_BAR_BORDER_WIDTH))
+    {
+        color = WHITE;
+    }
+
+    /* 已使用的油门区间采用连续实心填充，与原始UI画布保持一致。 */
+    if ((fill_width > 0U) && (x > THROTTLE_UI_BAR_LEFT) &&
+        (x <= (THROTTLE_UI_BAR_LEFT + fill_width)) &&
+        (y > THROTTLE_UI_BAR_TOP) && (y < THROTTLE_UI_BAR_BOTTOM))
+    {
+        color = THROTTLE_UI_COLOR_THROTTLE_FILL;
+    }
+
+    if (ThrottleUI_MediumTextPixel(x, y, 128U, 101U, raw_text) ||
+        ThrottleUI_MediumTextPixel(x, y, 171U, 101U, "MASK:") ||
+        ThrottleUI_MediumTextPixel(x, y, 215U, 101U, mask_text))
+    {
+        color = THROTTLE_UI_COLOR_FOREGROUND;
     }
 
     return color;
 }
 
-/**
- * @brief 把逻辑坐标区域旋转为 LCD 物理坐标并连续发送。
- *
- * 使用与主页面、转向页面一致的横屏旋转关系：
- * logical(x,y) -> physical(119-y,x)。此前油门页采用了相反方向的映射，
- * 导致整页相对其它页面倒置180°。
- * 物理列边界按控制器要求扩展到 4 像素对齐，但每个扩展像素仍重新计算颜色，
- * 不会把局部区域外的内容错误覆盖成纯色。
- */
 static void ThrottleUI_DrawLogicalRegion(const ThrottleUiView_t *view,
-                                         uint16_t x1,
-                                         uint16_t y1,
-                                         uint16_t x2,
-                                         uint16_t y2)
+                                         uint16_t logical_left,
+                                         uint16_t logical_top,
+                                         uint16_t logical_right,
+                                         uint16_t logical_bottom)
 {
-    char throttle_text[6];
-    char direction_text[6];
+    ThrottleUiView_t validated;
+    char limit_text[5];
+    char step_text[5];
+    char raw_text[5];
+    char mask_text[3];
     uint16_t physical_left;
     uint16_t physical_right;
     uint16_t physical_top;
     uint16_t physical_bottom;
-    uint16_t physical_y;
 
-    if ((view == NULL) || (x1 > x2) || (y1 > y2) ||
-        (x2 >= THROTTLE_UI_LOGICAL_WIDTH) ||
-        (y2 >= THROTTLE_UI_LOGICAL_HEIGHT))
+    if ((logical_left > logical_right) || (logical_top > logical_bottom) ||
+        (logical_left >= THROTTLE_UI_LOGICAL_WIDTH) ||
+        (logical_top >= THROTTLE_UI_LOGICAL_HEIGHT))
     {
         return;
     }
 
-    ThrottleUI_FormatNormalizedValue(view->throttle_normalized,
-                                     throttle_text);
-    ThrottleUI_FormatNormalizedValue(view->direction_normalized,
-                                     direction_text);
+    if (logical_right >= THROTTLE_UI_LOGICAL_WIDTH)
+    {
+        logical_right = THROTTLE_UI_LOGICAL_WIDTH - 1U;
+    }
+    if (logical_bottom >= THROTTLE_UI_LOGICAL_HEIGHT)
+    {
+        logical_bottom = THROTTLE_UI_LOGICAL_HEIGHT - 1U;
+    }
 
+    ThrottleUI_ValidateView(view, &validated);
+    ThrottleUI_FormatUint16(validated.limit, limit_text);
+    ThrottleUI_FormatUint16(validated.step, step_text);
+    ThrottleUI_FormatUint16(validated.raw_command, raw_text);
+    ThrottleUI_FormatMask(validated.motor_mask, mask_text);
 
-    /**
-     * 这是一个旋转坐标变换，控制显示器的显示方向
-     */
     physical_left =
-        (uint16_t)((THROTTLE_UI_LOGICAL_HEIGHT - 1U) - y2);
+        (THROTTLE_UI_LOGICAL_HEIGHT - 1U) - logical_bottom;
     physical_right =
-        (uint16_t)((THROTTLE_UI_LOGICAL_HEIGHT - 1U) - y1);
-    physical_top = x1;
-    physical_bottom = x2;
+        (THROTTLE_UI_LOGICAL_HEIGHT - 1U) - logical_top;
+    physical_top = logical_left;
+    physical_bottom = logical_right;
 
-    physical_left = (uint16_t)(physical_left & (uint16_t)~0x0003U);
-    physical_right = (uint16_t)(physical_right | 0x0003U);
+    /* SH8501列窗口按4像素对齐；扩展像素仍由完整页面生成器正确恢复。 */
+    physical_left &= (uint16_t)~3U;
+    physical_right |= 3U;
     if (physical_right >= LCD_W)
     {
-        physical_right = (uint16_t)(LCD_W - 1U);
+        physical_right = LCD_W - 1U;
     }
 
     LCD_Address_Set(physical_left,
@@ -280,25 +782,32 @@ static void ThrottleUI_DrawLogicalRegion(const ThrottleUiView_t *view,
                     physical_right,
                     physical_bottom);
 
-    for (physical_y = physical_top; physical_y <= physical_bottom; ++physical_y)
+    for (uint16_t physical_y = physical_top;
+         physical_y <= physical_bottom;
+         ++physical_y)
     {
         uint16_t buffer_index = 0U;
-        uint16_t physical_x;
 
-        for (physical_x = physical_left; physical_x <= physical_right; ++physical_x)
+        for (uint16_t physical_x = physical_left;
+             physical_x <= physical_right;
+             ++physical_x)
         {
-            uint16_t logical_x = physical_y;
-            uint16_t logical_y =
-                (uint16_t)((THROTTLE_UI_LOGICAL_HEIGHT - 1U) - physical_x);
-            uint16_t color = ThrottleUI_GetLogicalPixel(logical_x,
-                                                        logical_y,
-                                                        throttle_text,
-                                                        direction_text);
+            const uint16_t logical_x = physical_y;
+            const uint16_t logical_y =
+                (THROTTLE_UI_LOGICAL_HEIGHT - 1U) - physical_x;
+            const uint16_t pixel = ThrottleUI_GetLogicalPixel(
+                logical_x,
+                logical_y,
+                &validated,
+                limit_text,
+                step_text,
+                raw_text,
+                mask_text);
 
             g_throttle_ui_line_buffer[buffer_index++] =
-                (uint8_t)(color >> 8U);
+                (uint8_t)(pixel >> 8U);
             g_throttle_ui_line_buffer[buffer_index++] =
-                (uint8_t)(color & 0x00FFU);
+                (uint8_t)(pixel & 0x00FFU);
         }
 
         LCD_WriteDataBuffer(g_throttle_ui_line_buffer, buffer_index);
@@ -307,47 +816,148 @@ static void ThrottleUI_DrawLogicalRegion(const ThrottleUiView_t *view,
 
 void ThrottleUI_Draw(const ThrottleUiView_t *view)
 {
-    if (view == NULL)
-    {
-        return;
-    }
-
     ThrottleUI_DrawLogicalRegion(view,
                                  0U,
                                  0U,
-                                 (uint16_t)(THROTTLE_UI_LOGICAL_WIDTH - 1U),
-                                 (uint16_t)(THROTTLE_UI_LOGICAL_HEIGHT - 1U));
+                                 THROTTLE_UI_LOGICAL_WIDTH - 1U,
+                                 THROTTLE_UI_LOGICAL_HEIGHT - 1U);
 }
 
-void ThrottleUI_UpdateValues(const ThrottleUiView_t *previous,
-                             const ThrottleUiView_t *current)
+void ThrottleUI_Update(const ThrottleUiView_t *previous_view,
+                       const ThrottleUiView_t *current_view)
 {
-    if (current == NULL)
+    ThrottleUiView_t previous;
+    ThrottleUiView_t current;
+    uint16_t left;
+    uint16_t top;
+    uint16_t right;
+    uint16_t bottom;
+
+    if ((previous_view == NULL) || (current_view == NULL))
     {
+        ThrottleUI_Draw(current_view);
         return;
     }
 
-    if (previous == NULL)
+    ThrottleUI_ValidateView(previous_view, &previous);
+    ThrottleUI_ValidateView(current_view, &current);
+
+    if ((previous.focus != current.focus) ||
+        (previous.edit_mode != current.edit_mode))
     {
-        ThrottleUI_Draw(current);
-        return;
+        if (ThrottleUI_GetFocusBounds(
+                previous.focus, &previous,
+                &left, &top, &right, &bottom))
+        {
+            ThrottleUI_DrawLogicalRegion(
+                &current, left, top, right, bottom);
+        }
+        if ((previous.focus != current.focus) &&
+            ThrottleUI_GetFocusBounds(
+                current.focus, &current,
+                &left, &top, &right, &bottom))
+        {
+            ThrottleUI_DrawLogicalRegion(
+                &current, left, top, right, bottom);
+        }
     }
 
-    if (previous->throttle_normalized != current->throttle_normalized)
+    if (previous.motor_mask != current.motor_mask)
     {
-        ThrottleUI_DrawLogicalRegion(current,
-                                     56U,
-                                     57U,
-                                     99U,
-                                     76U);
+        const uint8_t changed_mask =
+            (uint8_t)(previous.motor_mask ^ current.motor_mask);
+
+        /* ALL颜色和MASK文本始终跟随8位掩码。 */
+        ThrottleUI_DrawLogicalRegion(&current, 0U, 0U, 42U, 26U);
+        ThrottleUI_DrawLogicalRegion(&current, 168U, 98U, 234U, 118U);
+
+        for (uint8_t index = 0U; index < 8U; ++index)
+        {
+            if ((changed_mask & (uint8_t)(1UL << index)) != 0U)
+            {
+                ThrottleUI_DrawLogicalRegion(
+                    &current,
+                    g_motor_icon_x[index] -
+                        THROTTLE_UI_MOTOR_FOCUS_PADDING,
+                    g_motor_icon_y[index] -
+                        THROTTLE_UI_MOTOR_FOCUS_PADDING,
+                    g_motor_icon_x[index] +
+                        THROTTLE_UI_MOTOR_ICON_WIDTH +
+                        THROTTLE_UI_MOTOR_FOCUS_PADDING - 1U,
+                    g_motor_icon_y[index] +
+                        THROTTLE_UI_MOTOR_ICON_HEIGHT +
+                        THROTTLE_UI_MOTOR_FOCUS_BOTTOM_PADDING - 1U);
+            }
+        }
     }
 
-    if (previous->direction_normalized != current->direction_normalized)
+    if (previous.limit != current.limit)
     {
-        ThrottleUI_DrawLogicalRegion(current,
-                                     176U,
-                                     57U,
-                                     219U,
-                                     76U);
+        uint16_t previous_right;
+        uint16_t current_right;
+
+        (void)ThrottleUI_GetFocusBounds(
+            THROTTLE_UI_FOCUS_LIMIT, &previous,
+            &left, &top, &previous_right, &bottom);
+        (void)ThrottleUI_GetFocusBounds(
+            THROTTLE_UI_FOCUS_LIMIT, &current,
+            &left, &top, &current_right, &bottom);
+
+        /* 使用新旧右边界的较大值，同时清除缩短数值留下的数字和边框。 */
+        right = (previous_right > current_right)
+                    ? previous_right
+                    : current_right;
+        ThrottleUI_DrawLogicalRegion(&current, left, top, right, bottom);
     }
+
+    if (previous.step != current.step)
+    {
+        uint16_t previous_right;
+        uint16_t current_right;
+
+        (void)ThrottleUI_GetFocusBounds(
+            THROTTLE_UI_FOCUS_STEP, &previous,
+            &left, &top, &previous_right, &bottom);
+        (void)ThrottleUI_GetFocusBounds(
+            THROTTLE_UI_FOCUS_STEP, &current,
+            &left, &top, &current_right, &bottom);
+
+        /* STEP从1000减小时，同一刷新区域会把旧的第四位及旧边框擦除。 */
+        right = (previous_right > current_right)
+                    ? previous_right
+                    : current_right;
+        ThrottleUI_DrawLogicalRegion(&current, left, top, right, bottom);
+    }
+
+    if (previous.throttle_unlocked != current.throttle_unlocked)
+    {
+        ThrottleUI_DrawLogicalRegion(&current, 209U, 0U, 239U, 26U);
+    }
+
+}
+
+void ThrottleUI_UpdateThrottleBar(const ThrottleUiView_t *view)
+{
+    /*
+     * 只重画边框及其内部填充；THR标签和右侧数字都属于固定/独立区域，
+     * 因此25 Hz更新不会重复发送它们的像素。
+     */
+    ThrottleUI_DrawLogicalRegion(view,
+                                 THROTTLE_UI_BAR_LEFT,
+                                 THROTTLE_UI_BAR_TOP,
+                                 THROTTLE_UI_BAR_RIGHT,
+                                 THROTTLE_UI_BAR_BOTTOM);
+}
+
+void ThrottleUI_UpdateThrottleValue(const ThrottleUiView_t *view)
+{
+    /*
+     * 固定覆盖8x16字模的最大4位宽度。数值由四位变成三位时，区域生成器
+     * 会同时恢复多余字符位置的页面背景，不会留下旧数字尾迹。
+     */
+    ThrottleUI_DrawLogicalRegion(view,
+                                 THROTTLE_UI_RAW_VALUE_LEFT,
+                                 THROTTLE_UI_RAW_VALUE_TOP,
+                                 THROTTLE_UI_RAW_VALUE_RIGHT,
+                                 THROTTLE_UI_RAW_VALUE_BOTTOM);
 }

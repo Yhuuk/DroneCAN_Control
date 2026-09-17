@@ -683,16 +683,12 @@ static uint16_t MainUI_GetLogicalPixel(uint16_t x,
         color = WHITE;
     }
 
-    /*
-     * 红色填充使用斜纹而非大块实色，既贴近参考图，也能在青色背景上
-     * 保持清楚但不过度刺眼。0%时填充宽度为0，只显示白色外框。
-     */
+    /* 已使用的油门区间采用连续实心填充；0%时只显示白色外框。 */
     if ((throttle_fill_width > 0U) &&
         (x > throttle_bar_left) &&
         (x <= (throttle_bar_left + throttle_fill_width)) &&
         (y > throttle_bar_top) &&
-        (y < throttle_bar_bottom) &&
-        ((((uint16_t)(x + y)) % 6U) < 4U))
+        (y < throttle_bar_bottom))
     {
         color = MAIN_UI_COLOR_THROTTLE;
     }

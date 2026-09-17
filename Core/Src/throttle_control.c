@@ -7,11 +7,17 @@
 /** joystick模块归一化后的正半轴最大值。 */
 #define THROTTLE_CONTROL_JOYSTICK_POSITIVE_MAX 1000
 
+/* 低13位保存0~8191上限，高8位保存电机掩码。一次32位写入同时发布二者。 */
+#define THROTTLE_CONTROL_LIMIT_MASK        0x00001FFFUL
+#define THROTTLE_CONTROL_MOTOR_MASK_SHIFT 16U
+
 /*
- * InputTask写、CanTask和UiTask读。使用对齐的32位变量可在STM32L431上单次读写，
- * volatile防止编译器缓存跨任务状态；当前只有一位状态，不需要互斥锁。
+ * 解锁字由InputTask写，配置字由UiTask写，CanTask/UiTask读取。两个变量均为
+ * 对齐32位值，STM32L431可单次完成读写；配置字把LIM和MASK一起发布，避免
+ * CanTask读到一半新、一半旧的组合。volatile用于禁止跨任务缓存。
  */
 static volatile uint32_t g_throttle_unlocked_word;
+static volatile uint32_t g_throttle_configuration_word;
 
 volatile uint32_t g_throttle_unlock_count;
 volatile uint32_t g_throttle_unlock_rejected_count;
@@ -20,6 +26,10 @@ volatile uint32_t g_throttle_lock_count;
 void ThrottleControl_Init(void)
 {
     g_throttle_unlocked_word = 0U;
+    g_throttle_configuration_word =
+        ((uint32_t)THROTTLE_CONTROL_DEFAULT_MOTOR_MASK <<
+         THROTTLE_CONTROL_MOTOR_MASK_SHIFT) |
+        (uint32_t)THROTTLE_CONTROL_DEFAULT_LIMIT;
     g_throttle_unlock_count = 0U;
     g_throttle_unlock_rejected_count = 0U;
     g_throttle_lock_count = 0U;
@@ -64,9 +74,22 @@ bool ThrottleControl_IsUnlocked(void)
     return g_throttle_unlocked_word != 0U;
 }
 
+void ThrottleControl_SetConfiguration(uint8_t motor_mask, uint16_t limit)
+{
+    if (limit > THROTTLE_CONTROL_RAW_COMMAND_MAX)
+    {
+        limit = THROTTLE_CONTROL_RAW_COMMAND_MAX;
+    }
+
+    g_throttle_configuration_word =
+        ((uint32_t)motor_mask << THROTTLE_CONTROL_MOTOR_MASK_SHIFT) |
+        ((uint32_t)limit & THROTTLE_CONTROL_LIMIT_MASK);
+}
+
 bool ThrottleControl_GetSnapshot(ThrottleControlSnapshot_t *snapshot)
 {
     JoystickNormalizedValues_t joystick;
+    uint32_t configuration_word;
     uint32_t mapped_command;
 
     if (snapshot == NULL)
@@ -74,6 +97,11 @@ bool ThrottleControl_GetSnapshot(ThrottleControlSnapshot_t *snapshot)
         return false;
     }
 
+    configuration_word = g_throttle_configuration_word;
+    snapshot->limit =
+        (uint16_t)(configuration_word & THROTTLE_CONTROL_LIMIT_MASK);
+    snapshot->motor_mask =
+        (uint8_t)(configuration_word >> THROTTLE_CONTROL_MOTOR_MASK_SHIFT);
     snapshot->unlocked = ThrottleControl_IsUnlocked();
     snapshot->raw_command = 0U;
 
@@ -88,12 +116,17 @@ bool ThrottleControl_GetSnapshot(ThrottleControlSnapshot_t *snapshot)
     }
 
     /*
-     * 把摇杆正半轴1~1000线性映射为RawCommand 1~100。加入半个除数完成
-     * 四舍五入；极小正值若舍入为0则提升为1，保证“大于0即为正油门”。
+     * 把摇杆正半轴1~1000线性映射为RawCommand 1~limit。加入半个除数完成
+     * 四舍五入；limit为0时明确保持0，不执行“最小提升为1”。
      */
+    if (snapshot->limit == 0U)
+    {
+        return true;
+    }
+
     mapped_command =
         (((uint32_t)joystick.throttle_normalized *
-          THROTTLE_CONTROL_RAW_COMMAND_MAX) +
+          snapshot->limit) +
          (THROTTLE_CONTROL_JOYSTICK_POSITIVE_MAX / 2U)) /
         THROTTLE_CONTROL_JOYSTICK_POSITIVE_MAX;
 
@@ -101,11 +134,20 @@ bool ThrottleControl_GetSnapshot(ThrottleControlSnapshot_t *snapshot)
     {
         mapped_command = 1U;
     }
-    else if (mapped_command > THROTTLE_CONTROL_RAW_COMMAND_MAX)
+    else if (mapped_command > snapshot->limit)
     {
-        mapped_command = THROTTLE_CONTROL_RAW_COMMAND_MAX;
+        mapped_command = snapshot->limit;
     }
 
-    snapshot->raw_command = (uint16_t)mapped_command;
+    /* 锁定可能与本次计算并发发生；发布快照前再检查一次，避免沿用非零值。 */
+    if (!ThrottleControl_IsUnlocked())
+    {
+        snapshot->unlocked = false;
+        snapshot->raw_command = 0U;
+    }
+    else
+    {
+        snapshot->raw_command = (uint16_t)mapped_command;
+    }
     return true;
 }

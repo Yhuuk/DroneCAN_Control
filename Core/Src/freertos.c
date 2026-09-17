@@ -106,8 +106,22 @@ typedef enum
 {
   UI_PAGE_MAIN = 0,
   UI_PAGE_MOTOR_DIRECTION,
-  UI_PAGE_THROTTLE_DEBUG
+  UI_PAGE_THROTTLE
 } UiPage_t;
+
+/**
+ * @brief CanTask内部的油门发布状态。
+ *
+ * LOCKED_SILENT：关锁且保持总线静默，不发布RawCommand；
+ * UNLOCKED_ACTIVE：解锁后以固定周期发布当前8路目标；
+ * LOCKING_ZERO_FLUSH：刚从解锁切到关锁，先发布若干次全零再静默。
+ */
+typedef enum
+{
+  CAN_THROTTLE_PUBLISH_LOCKED_SILENT = 0,
+  CAN_THROTTLE_PUBLISH_UNLOCKED_ACTIVE,
+  CAN_THROTTLE_PUBLISH_LOCKING_ZERO_FLUSH
+} CanThrottlePublishState_t;
 
 /* USER CODE END PTD */
 
@@ -130,11 +144,20 @@ typedef enum
  */
 #define UI_EVENT_QUEUE_LENGTH 16U
 
-/** 临时油门调试页以10 Hz刷新数值，读数流畅且不会持续占用SPI总线。 */
-#define THROTTLE_UI_REFRESH_PERIOD_MS 100U
+/** 主页面油门进度条以25 Hz局部刷新，锁图标也随同检查但仅在变化时绘制。 */
+#define MAIN_UI_REFRESH_PERIOD_MS 40U
+
+/** 油门页进度条以25 Hz刷新，兼顾连续观感与当前阻塞SPI负载。 */
+#define THROTTLE_UI_BAR_REFRESH_PERIOD_MS 40U
+
+/** 精确油门数字以20 Hz刷新，避免数字跳动过快且降低无效绘制量。 */
+#define THROTTLE_UI_VALUE_REFRESH_PERIOD_MS 50U
 
 /** 以100 Hz周期广播最新8路油门目标，与InputTask的10 ms快照周期一致。 */
 #define THROTTLE_RAW_COMMAND_PUBLISH_PERIOD_MS 10U
+
+/** 关锁时连续成功入队5次全零RawCommand，然后停止发布并释放总线控制权。 */
+#define THROTTLE_LOCK_ZERO_FLUSH_COUNT 5U
 
 /** 方向反馈LED每100 ms切换一次，形成清晰的快速闪烁。 */
 #define DIRECTION_LED_FLASH_HALF_PERIOD_MS 100U
@@ -144,6 +167,9 @@ typedef enum
 
 /**蜂鸣器快速响400ms，400ms这个鸣叫时间我觉得刚刚好 */
 #define DIRECTION_BUZZ_DURATION_MS 400U
+
+/** 油门锁切换只需短促提示，100 ms足够分辨且不会干扰连续操作。 */
+#define THROTTLE_LOCK_BUZZ_DURATION_MS 100U
 
 /**
  * 接收板执行一次DShot方向修改约需1.59秒。在上一条命令提交后的2秒内
@@ -236,6 +262,9 @@ volatile uint16_t g_last_throttle_raw_command;
 volatile int16_t g_last_throttle_enqueue_result;
 volatile uint32_t g_throttle_publish_count;
 volatile uint32_t g_throttle_publish_error_count;
+/** 当前发布状态和关锁全零剩余次数，仅用于调试器观察。 */
+volatile CanThrottlePublishState_t g_throttle_publish_state;
+volatile uint8_t g_throttle_zero_flush_remaining;
 /** UiTask已经成功放入CanCommandQueue的方向命令数量。 */
 volatile uint32_t g_ui_direction_command_submitted_count;
 /** 因CanCommandQueue已满而未能提交的方向命令数量。 */
@@ -298,11 +327,22 @@ const osThreadAttr_t InputTask_attributes = {
 /* USER CODE BEGIN FunctionPrototypes */
 
 static void InputTask_PostUiEvent(const KeyEvent_t *key_event);
-static bool UiTask_ReadThrottleView(ThrottleUiView_t *view);
+static uint32_t UiTask_TicksUntil(uint32_t now_tick,
+                                  uint32_t deadline_tick);
+static void UiTask_AdvancePeriodicDeadline(uint32_t *deadline_tick,
+                                           uint32_t period_ticks,
+                                           uint32_t now_tick);
+static bool UiTask_UpdateThrottleView(ThrottleUiView_t *view);
 static bool UiTask_UpdateMainThrottleView(MainUiView_t *view);
 static bool UiTask_HandleMainInput(MainUiView_t *view,
                                    const UiInputEvent_t *event);
 static void UiTask_PrepareDirectionPageEntry(MotorDirectionUiView_t *view);
+static void UiTask_PrepareThrottlePageEntry(ThrottleUiView_t *view);
+static bool UiTask_ShouldLeaveThrottlePage(
+    const ThrottleUiView_t *view,
+    const UiInputEvent_t *event);
+static bool UiTask_HandleThrottleInput(ThrottleUiView_t *view,
+                                       const UiInputEvent_t *event);
 static bool UiTask_ShouldLeaveDirectionPage(
     const MotorDirectionUiView_t *view,
     const UiInputEvent_t *event);
@@ -323,6 +363,8 @@ static void DirectionLedFeedback_Start(void);
 static void DirectionLedTimerCallback(void *argument);
 static void DirectionBuzzTimerCallback(void *argument);
 static void DirectionBuzzFeedback(void);
+static void BuzzerFeedback_Start(uint32_t duration_ms);
+static void ThrottleLockHardwareFeedback(bool unlocked);
 static bool UiTask_SubmitDirectionQuery(
     MotorDirectionUiView_t *view,
     UiDirectionQueryControl_t *control);
@@ -470,6 +512,11 @@ void MX_FREERTOS_Init(void) {
   HAL_GPIO_WritePin(Direction_LED_GPIO_Port,
                     Direction_LED_Pin,
                     GPIO_PIN_SET);
+
+  /* 油门LED同样低电平点亮；系统上电默认锁定，因此必须保持熄灭。 */
+  HAL_GPIO_WritePin(Throttle_LED_GPIO_Port,
+                    Throttle_LED_Pin,
+                    GPIO_PIN_SET);
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
@@ -550,8 +597,14 @@ void StartUiTask(void *argument)
   };
   UiPage_t current_page = UI_PAGE_MAIN;
   ThrottleUiView_t throttle_view = {
-      .throttle_normalized = 0,
-      .direction_normalized = 0
+      .throttle_unlocked = false,
+      .edit_mode = false,
+      .motor_mask = THROTTLE_CONTROL_DEFAULT_MOTOR_MASK,
+      .limit = THROTTLE_CONTROL_DEFAULT_LIMIT,
+      .step = 100U,
+      .raw_command = 0U,
+      .throttle_percent = 0U,
+      .focus = THROTTLE_UI_FOCUS_ALL
   };
   MotorDirectionUiView_t view = {
       .power_state = MOTOR_DIRECTION_UI_POWER_OFF,
@@ -584,6 +637,12 @@ void StartUiTask(void *argument)
   UiEventMessage_t event_message;
   uint32_t refresh_start_tick;
   uint32_t refresh_duration;
+  uint32_t next_main_refresh_tick;
+  uint32_t next_throttle_bar_refresh_tick;
+  uint32_t next_throttle_value_refresh_tick;
+  uint32_t queue_wait_ticks;
+  uint8_t displayed_throttle_percent = throttle_view.throttle_percent;
+  uint16_t displayed_raw_command = throttle_view.raw_command;
   osStatus_t queue_status;
 
   (void)argument;
@@ -600,42 +659,97 @@ void StartUiTask(void *argument)
   refresh_duration = osKernelGetTickCount() - refresh_start_tick;
   g_ui_last_refresh_time_ms = refresh_duration;
   g_ui_max_refresh_time_ms = refresh_duration;
+  next_main_refresh_tick =
+      osKernelGetTickCount() + pdMS_TO_TICKS(MAIN_UI_REFRESH_PERIOD_MS);
+  next_throttle_bar_refresh_tick = 0U;
+  next_throttle_value_refresh_tick = 0U;
 
   /* Infinite loop */
   for(;;)
   {
     /*
-     * 主页面每100 ms局部刷新锁图标和油门条；临时油门页每100 ms刷新
-     * ADC值。方向页面没有周期显示需求，仍可永久阻塞等待事件。
+     * 连续油门显示使用绝对截止时间，而不是依赖消息队列的一次相对超时。
+     * 因此即使期间不断收到按键消息，40/50 ms显示周期也不会被重新起算。
      */
-    queue_status = osMessageQueueGet(
-        UiEventQueueHandle,
-        &event_message,
-        NULL,
-        ((current_page == UI_PAGE_MAIN) ||
-         (current_page == UI_PAGE_THROTTLE_DEBUG))
-            ? pdMS_TO_TICKS(THROTTLE_UI_REFRESH_PERIOD_MS)
-            : osWaitForever);
+    uint32_t now_tick = osKernelGetTickCount();
 
-    if (queue_status == osErrorTimeout)
+    if ((current_page == UI_PAGE_MAIN) &&
+        ((int32_t)(now_tick - next_main_refresh_tick) >= 0))
     {
-      if (current_page == UI_PAGE_MAIN)
-      {
-        const MainUiView_t previous_main_view = main_view;
+      const MainUiView_t previous_main_view = main_view;
 
-        if (UiTask_UpdateMainThrottleView(&main_view))
+      if (UiTask_UpdateMainThrottleView(&main_view))
+      {
+        refresh_start_tick = osKernelGetTickCount();
+        MainUI_UpdateThrottleStatus(&previous_main_view, &main_view);
+        refresh_duration = osKernelGetTickCount() - refresh_start_tick;
+        g_ui_last_refresh_time_ms = refresh_duration;
+        if (refresh_duration > g_ui_max_refresh_time_ms)
         {
-          MainUI_UpdateThrottleStatus(&previous_main_view, &main_view);
+          g_ui_max_refresh_time_ms = refresh_duration;
         }
       }
-      else if (current_page == UI_PAGE_THROTTLE_DEBUG)
+
+      UiTask_AdvancePeriodicDeadline(
+          &next_main_refresh_tick,
+          pdMS_TO_TICKS(MAIN_UI_REFRESH_PERIOD_MS),
+          now_tick);
+    }
+    else if (current_page == UI_PAGE_THROTTLE)
+    {
+      const bool bar_due =
+          ((int32_t)(now_tick - next_throttle_bar_refresh_tick) >= 0);
+      const bool value_due =
+          ((int32_t)(now_tick - next_throttle_value_refresh_tick) >= 0);
+
+      if (bar_due || value_due)
       {
         const ThrottleUiView_t previous_throttle_view = throttle_view;
+        bool refresh_performed = false;
 
-        if (UiTask_ReadThrottleView(&throttle_view))
+        refresh_start_tick = osKernelGetTickCount();
+
+        /* 一次读取最新快照，供同一时刻到期的进度条和数字共同使用。 */
+        if (UiTask_UpdateThrottleView(&throttle_view))
         {
-          refresh_start_tick = osKernelGetTickCount();
-          ThrottleUI_UpdateValues(&previous_throttle_view, &throttle_view);
+          /* 锁、MASK或LIM等低频状态仍由通用局部更新接口处理。 */
+          ThrottleUI_Update(&previous_throttle_view, &throttle_view);
+          refresh_performed = true;
+        }
+
+        if (bar_due)
+        {
+          if (displayed_throttle_percent !=
+              throttle_view.throttle_percent)
+          {
+            ThrottleUI_UpdateThrottleBar(&throttle_view);
+            displayed_throttle_percent = throttle_view.throttle_percent;
+            refresh_performed = true;
+          }
+
+          UiTask_AdvancePeriodicDeadline(
+              &next_throttle_bar_refresh_tick,
+              pdMS_TO_TICKS(THROTTLE_UI_BAR_REFRESH_PERIOD_MS),
+              now_tick);
+        }
+
+        if (value_due)
+        {
+          if (displayed_raw_command != throttle_view.raw_command)
+          {
+            ThrottleUI_UpdateThrottleValue(&throttle_view);
+            displayed_raw_command = throttle_view.raw_command;
+            refresh_performed = true;
+          }
+
+          UiTask_AdvancePeriodicDeadline(
+              &next_throttle_value_refresh_tick,
+              pdMS_TO_TICKS(THROTTLE_UI_VALUE_REFRESH_PERIOD_MS),
+              now_tick);
+        }
+
+        if (refresh_performed)
+        {
           refresh_duration = osKernelGetTickCount() - refresh_start_tick;
           g_ui_last_refresh_time_ms = refresh_duration;
           if (refresh_duration > g_ui_max_refresh_time_ms)
@@ -644,7 +758,38 @@ void StartUiTask(void *argument)
           }
         }
       }
+    }
 
+    now_tick = osKernelGetTickCount();
+    if (current_page == UI_PAGE_MAIN)
+    {
+      queue_wait_ticks =
+          UiTask_TicksUntil(now_tick, next_main_refresh_tick);
+    }
+    else if (current_page == UI_PAGE_THROTTLE)
+    {
+      const uint32_t bar_wait =
+          UiTask_TicksUntil(now_tick, next_throttle_bar_refresh_tick);
+      const uint32_t value_wait =
+          UiTask_TicksUntil(now_tick, next_throttle_value_refresh_tick);
+
+      queue_wait_ticks = (bar_wait < value_wait) ? bar_wait : value_wait;
+    }
+    else
+    {
+      /* 方向页面没有连续显示项，可以永久等待下一条UI消息。 */
+      queue_wait_ticks = osWaitForever;
+    }
+
+    queue_status = osMessageQueueGet(
+        UiEventQueueHandle,
+        &event_message,
+        NULL,
+        queue_wait_ticks);
+
+    if (queue_status == osErrorTimeout)
+    {
+      /* 回到循环顶部，由绝对截止时间决定本次应刷新的动态区域。 */
       continue;
     }
 
@@ -663,12 +808,22 @@ void StartUiTask(void *argument)
             (input->action == UI_INPUT_ACTION_LONG_PRESS))
         {
           const MainUiView_t previous_main_view = main_view;
+          const ThrottleUiView_t previous_throttle_view = throttle_view;
 
           /* InputTask已经及时完成状态切换；UiTask只同步显示，不重复切换。 */
-          if (UiTask_UpdateMainThrottleView(&main_view) &&
-              (current_page == UI_PAGE_MAIN))
+          const bool main_changed =
+              UiTask_UpdateMainThrottleView(&main_view);
+          const bool throttle_changed =
+              UiTask_UpdateThrottleView(&throttle_view);
+
+          if (main_changed && (current_page == UI_PAGE_MAIN))
           {
             MainUI_UpdateThrottleStatus(&previous_main_view, &main_view);
+          }
+          else if (throttle_changed &&
+                   (current_page == UI_PAGE_THROTTLE))
+          {
+            ThrottleUI_Update(&previous_throttle_view, &throttle_view);
           }
           continue;
         }
@@ -701,11 +856,11 @@ void StartUiTask(void *argument)
 
               case MAIN_UI_FOCUS_THROTTLE:
                 /*
-                 * 当前油门页是ADC联调页面：进入时读取最近快照并整屏绘制，
-                 * 之后由UiTask每100 ms只刷新发生变化的四位数值区域。
+                 * 每次从主页面进入时焦点回到ALL，但保留上一次通道掩码、
+                 * LIM和Step；实际控制状态从ThrottleControl快照同步。
                  */
-                (void)UiTask_ReadThrottleView(&throttle_view);
-                current_page = UI_PAGE_THROTTLE_DEBUG;
+                UiTask_PrepareThrottlePageEntry(&throttle_view);
+                current_page = UI_PAGE_THROTTLE;
 
                 refresh_start_tick = osKernelGetTickCount();
                 ThrottleUI_Draw(&throttle_view);
@@ -716,6 +871,17 @@ void StartUiTask(void *argument)
                 {
                   g_ui_max_refresh_time_ms = refresh_duration;
                 }
+                /* 整页已包含最新动态值，后续从完整绘制结束时重新计时。 */
+                displayed_throttle_percent =
+                    throttle_view.throttle_percent;
+                displayed_raw_command = throttle_view.raw_command;
+                now_tick = osKernelGetTickCount();
+                next_throttle_bar_refresh_tick =
+                    now_tick +
+                    pdMS_TO_TICKS(THROTTLE_UI_BAR_REFRESH_PERIOD_MS);
+                next_throttle_value_refresh_tick =
+                    now_tick +
+                    pdMS_TO_TICKS(THROTTLE_UI_VALUE_REFRESH_PERIOD_MS);
                 break;
 
               case MAIN_UI_FOCUS_SETTINGS:
@@ -765,6 +931,9 @@ void StartUiTask(void *argument)
             {
               g_ui_max_refresh_time_ms = refresh_duration;
             }
+            next_main_refresh_tick =
+                osKernelGetTickCount() +
+                pdMS_TO_TICKS(MAIN_UI_REFRESH_PERIOD_MS);
           }
           else if (UiTask_HandleInputEvent(&view,
                                            &direction_control,
@@ -785,15 +954,11 @@ void StartUiTask(void *argument)
             }
           }
         }
-        else if (current_page == UI_PAGE_THROTTLE_DEBUG)
+        else if (current_page == UI_PAGE_THROTTLE)
         {
-          /*
-           * 临时联调页不执行油门业务，只接受BACK短按或长按返回主页面。
-           * 返回后焦点仍停在“油门”入口，便于反复进入观察ADC。
-           */
-          if ((input->key_id == KEY_ID_BACK) &&
-              ((input->action == UI_INPUT_ACTION_SHORT_PRESS) ||
-               (input->action == UI_INPUT_ACTION_LONG_PRESS)))
+          const ThrottleUiView_t previous_throttle_view = throttle_view;
+
+          if (UiTask_ShouldLeaveThrottlePage(&throttle_view, input))
           {
             main_view.focus = MAIN_UI_FOCUS_THROTTLE;
             current_page = UI_PAGE_MAIN;
@@ -801,6 +966,20 @@ void StartUiTask(void *argument)
 
             refresh_start_tick = osKernelGetTickCount();
             MainUI_Draw(&main_view);
+            refresh_duration = osKernelGetTickCount() - refresh_start_tick;
+            g_ui_last_refresh_time_ms = refresh_duration;
+            if (refresh_duration > g_ui_max_refresh_time_ms)
+            {
+              g_ui_max_refresh_time_ms = refresh_duration;
+            }
+            next_main_refresh_tick =
+                osKernelGetTickCount() +
+                pdMS_TO_TICKS(MAIN_UI_REFRESH_PERIOD_MS);
+          }
+          else if (UiTask_HandleThrottleInput(&throttle_view, input))
+          {
+            refresh_start_tick = osKernelGetTickCount();
+            ThrottleUI_Update(&previous_throttle_view, &throttle_view);
             refresh_duration = osKernelGetTickCount() - refresh_start_tick;
             g_ui_last_refresh_time_ms = refresh_duration;
             if (refresh_duration > g_ui_max_refresh_time_ms)
@@ -910,8 +1089,13 @@ void StartCanTask(void *argument)
   DroneCANThrottleCommand_t throttle_command = {0};
   ThrottleControlSnapshot_t throttle_snapshot = {
       .unlocked = false,
-      .raw_command = 0U
+      .raw_command = 0U,
+      .limit = THROTTLE_CONTROL_DEFAULT_LIMIT,
+      .motor_mask = THROTTLE_CONTROL_DEFAULT_MOTOR_MASK
   };
+  CanThrottlePublishState_t throttle_publish_state =
+      CAN_THROTTLE_PUBLISH_LOCKED_SILENT;
+  uint8_t zero_flush_remaining = 0U;
   uint32_t next_throttle_publish_tick;
   CanDirectionQueryControl_t query_control = {
       .active = false,
@@ -938,6 +1122,8 @@ void StartCanTask(void *argument)
 
   DroneCAN_Node_Init();
   next_throttle_publish_tick = osKernelGetTickCount();
+  g_throttle_publish_state = throttle_publish_state;
+  g_throttle_zero_flush_remaining = zero_flush_remaining;
 
 
   /* Infinite loop */
@@ -972,39 +1158,130 @@ void StartCanTask(void *argument)
     CanTask_PollDirectionQuery(&query_control);
 
     /*
-     * 油门是连续状态而不是离散命令，因此CanTask直接读取最新快照，每
-     * 10 ms构造一次完整8路RawCommand。不会经过普通命令队列，因而CAN
-     * 短暂繁忙时不会在FreeRTOS队列中积压已经过期的摇杆值。
+     * 油门是连续状态而不是离散命令，因此CanTask直接读取最新快照。
+     * 解锁时每10 ms构造一次完整8路RawCommand；关锁后先可靠地发布5次
+     * 全零，再停止发布。油门不经过普通命令队列，避免积压过期摇杆值。
      */
     const uint32_t now_tick = osKernelGetTickCount();
     if ((int32_t)(now_tick - next_throttle_publish_tick) >= 0)
     {
+      bool should_publish = false;
+      bool publish_for_zero_flush = false;
+
       if (!ThrottleControl_GetSnapshot(&throttle_snapshot))
       {
-        /* ADC快照异常时仍周期发送全零，不能沿用上一轮非零油门。 */
+        /* ADC快照异常按锁定处理，绝不能沿用上一轮非零油门。 */
         throttle_snapshot.unlocked = false;
         throttle_snapshot.raw_command = 0U;
       }
 
-      for (uint8_t channel = 0U;
-           channel < DRONECAN_ESC_CHANNEL_COUNT;
-           ++channel)
+      switch (throttle_publish_state)
       {
-        /* 当前联调阶段未启用掩码：8路电机使用同一个摇杆油门值。 */
-        throttle_command.motor[channel] = throttle_snapshot.raw_command;
+        case CAN_THROTTLE_PUBLISH_LOCKED_SILENT:
+          if (throttle_snapshot.unlocked)
+          {
+            /* 解锁后的第一周期就发布；安全解锁条件保证初始值通常为0。 */
+            throttle_publish_state =
+                CAN_THROTTLE_PUBLISH_UNLOCKED_ACTIVE;
+            should_publish = true;
+          }
+          break;
+
+        case CAN_THROTTLE_PUBLISH_UNLOCKED_ACTIVE:
+          if (throttle_snapshot.unlocked)
+          {
+            should_publish = true;
+          }
+          else
+          {
+            /* 关锁不能只停止发送：先用数次全零覆盖接收端的最后非零值。 */
+            throttle_publish_state =
+                CAN_THROTTLE_PUBLISH_LOCKING_ZERO_FLUSH;
+            zero_flush_remaining = THROTTLE_LOCK_ZERO_FLUSH_COUNT;
+            should_publish = true;
+            publish_for_zero_flush = true;
+          }
+          break;
+
+        case CAN_THROTTLE_PUBLISH_LOCKING_ZERO_FLUSH:
+          if (throttle_snapshot.unlocked)
+          {
+            /* 防御快速重新解锁：立即恢复正常发布，不继续发送关锁零帧。 */
+            throttle_publish_state =
+                CAN_THROTTLE_PUBLISH_UNLOCKED_ACTIVE;
+            zero_flush_remaining = 0U;
+            should_publish = true;
+          }
+          else
+          {
+            should_publish = true;
+            publish_for_zero_flush = true;
+          }
+          break;
+
+        default:
+          /* 状态损坏时回到最安全的静默锁定状态。 */
+          throttle_publish_state = CAN_THROTTLE_PUBLISH_LOCKED_SILENT;
+          zero_flush_remaining = 0U;
+          break;
       }
 
-      g_last_throttle_raw_command = throttle_snapshot.raw_command;
-      g_last_throttle_enqueue_result =
-          DroneCAN_PublishRawCommand(&throttle_command);
-      if (g_last_throttle_enqueue_result > 0)
+      if (should_publish)
       {
-        ++g_throttle_publish_count;
+        for (uint8_t channel = 0U;
+             channel < DRONECAN_ESC_CHANNEL_COUNT;
+             ++channel)
+        {
+          /*
+           * RawCommand没有协议级掩码字段，因此始终编码8个数组元素。
+           * 关锁清零阶段无条件写8路0；正常解锁阶段只有MASK选中的通道
+           * 使用当前油门，未选中通道明确写0。
+           */
+          throttle_command.motor[channel] = publish_for_zero_flush
+              ? 0U
+              : (((throttle_snapshot.motor_mask &
+                   (uint8_t)(1UL << channel)) != 0U)
+                     ? throttle_snapshot.raw_command
+                     : 0U);
+        }
+
+        g_last_throttle_raw_command = publish_for_zero_flush
+                                          ? 0U
+                                          : throttle_snapshot.raw_command;
+        g_last_throttle_enqueue_result =
+            DroneCAN_PublishRawCommand(&throttle_command);
+        if (g_last_throttle_enqueue_result > 0)
+        {
+          ++g_throttle_publish_count;
+
+          /*
+           * 只有成功加入libcanard队列才算一次清零发送；失败时保留计数，
+           * 下一周期继续重试，不能在零帧实际未提交时提前进入静默。
+           */
+          if (publish_for_zero_flush && (zero_flush_remaining > 0U))
+          {
+            --zero_flush_remaining;
+            if (zero_flush_remaining == 0U)
+            {
+              throttle_publish_state =
+                  CAN_THROTTLE_PUBLISH_LOCKED_SILENT;
+            }
+          }
+        }
+        else
+        {
+          ++g_throttle_publish_error_count;
+        }
       }
       else
       {
-        ++g_throttle_publish_error_count;
+        /* 关锁静默不是发送错误；清除最近值，便于Watch窗口明确识别。 */
+        g_last_throttle_raw_command = 0U;
+        g_last_throttle_enqueue_result = 0;
       }
+
+      g_throttle_publish_state = throttle_publish_state;
+      g_throttle_zero_flush_remaining = zero_flush_remaining;
 
       next_throttle_publish_tick +=
           pdMS_TO_TICKS(THROTTLE_RAW_COMMAND_PUBLISH_PERIOD_MS);
@@ -1107,13 +1384,25 @@ void StartInputTask(void *argument)
          */
         if (event->key_id == KEY_ID_SWITCH)
         {
-          if (ThrottleControl_IsUnlocked())
+          const bool was_unlocked = ThrottleControl_IsUnlocked();
+
+          if (was_unlocked)
           {
             ThrottleControl_Lock();
           }
           else
           {
             (void)ThrottleControl_TryUnlock();
+          }
+
+          /*
+           * 只有锁状态真正发生变化才更新LED并鸣叫。摇杆不在安全位置导致
+           * 解锁被拒绝时既不点亮LED，也不产生“成功”提示音。
+           */
+          const bool is_unlocked = ThrottleControl_IsUnlocked();
+          if (is_unlocked != was_unlocked)
+          {
+            ThrottleLockHardwareFeedback(is_unlocked);
           }
         }
 
@@ -1146,24 +1435,87 @@ void StartInputTask(void *argument)
 /* USER CODE BEGIN Application */
 
 /**
- * @brief 将摇杆驱动快照转换为临时油门页面的数据模型。
+ * @brief 计算距离绝对截止时间还剩多少RTOS Tick。
  *
- * UiTask只通过此接口读取InputTask发布的数据，不直接读取DMA缓冲区，避免
- * 显示层依赖ADC Rank和DMA数组布局。
+ * 使用有符号差值可正确处理32位Tick自然回绕；已经到期时返回0，使UiTask
+ * 不阻塞并立即回到循环顶部执行刷新。
  */
-static bool UiTask_ReadThrottleView(ThrottleUiView_t *view)
+static uint32_t UiTask_TicksUntil(uint32_t now_tick,
+                                  uint32_t deadline_tick)
 {
-  JoystickNormalizedValues_t normalized_values;
+  const int32_t remaining = (int32_t)(deadline_tick - now_tick);
 
-  if ((view == NULL) ||
-      !Joystick_GetLatestNormalized(&normalized_values))
+  return (remaining > 0) ? (uint32_t)remaining : 0U;
+}
+
+/**
+ * @brief 把周期截止时间推进到未来，且不补画已经错过的历史帧。
+ *
+ * LCD刷新若偶尔超过一个周期，只显示最新油门快照；连续补画旧值既增加
+ * 延迟，也会占用本应留给CAN和输入任务的CPU时间。
+ */
+static void UiTask_AdvancePeriodicDeadline(uint32_t *deadline_tick,
+                                           uint32_t period_ticks,
+                                           uint32_t now_tick)
+{
+  if ((deadline_tick == NULL) || (period_ticks == 0U))
+  {
+    return;
+  }
+
+  *deadline_tick += period_ticks;
+  if ((int32_t)(now_tick - *deadline_tick) >= 0)
+  {
+    *deadline_tick = now_tick + period_ticks;
+  }
+}
+
+/**
+ * @brief 将油门控制层快照同步到油门页面，不改变本页焦点和编辑状态。
+ * @return true表示锁、掩码、LIM或实际油门发生变化，需要局部刷新。
+ */
+static bool UiTask_UpdateThrottleView(ThrottleUiView_t *view)
+{
+  ThrottleControlSnapshot_t snapshot = {
+      .unlocked = false,
+      .raw_command = 0U,
+      .limit = THROTTLE_CONTROL_DEFAULT_LIMIT,
+      .motor_mask = THROTTLE_CONTROL_DEFAULT_MOTOR_MASK
+  };
+  uint8_t throttle_percent = 0U;
+  bool changed;
+
+  if (view == NULL)
   {
     return false;
   }
 
-  view->throttle_normalized = normalized_values.throttle_normalized;
-  view->direction_normalized = normalized_values.direction_normalized;
-  return true;
+  (void)ThrottleControl_GetSnapshot(&snapshot);
+  if (snapshot.limit > 0U)
+  {
+    /* 进度条显示当前LIM内的摇杆百分比，旁边数字显示精确RawCommand。 */
+    throttle_percent =
+        (uint8_t)((((uint32_t)snapshot.raw_command * 100U) +
+                   (snapshot.limit / 2U)) /
+                  snapshot.limit);
+    if (throttle_percent > 100U)
+    {
+      throttle_percent = 100U;
+    }
+  }
+
+  changed = (view->throttle_unlocked != snapshot.unlocked) ||
+            (view->motor_mask != snapshot.motor_mask) ||
+            (view->limit != snapshot.limit) ||
+            (view->raw_command != snapshot.raw_command) ||
+            (view->throttle_percent != throttle_percent);
+
+  view->throttle_unlocked = snapshot.unlocked;
+  view->motor_mask = snapshot.motor_mask;
+  view->limit = snapshot.limit;
+  view->raw_command = snapshot.raw_command;
+  view->throttle_percent = throttle_percent;
+  return changed;
 }
 
 /**
@@ -1177,8 +1529,11 @@ static bool UiTask_UpdateMainThrottleView(MainUiView_t *view)
 {
   ThrottleControlSnapshot_t snapshot = {
       .unlocked = false,
-      .raw_command = 0U
+      .raw_command = 0U,
+      .limit = THROTTLE_CONTROL_DEFAULT_LIMIT,
+      .motor_mask = THROTTLE_CONTROL_DEFAULT_MOTOR_MASK
   };
+  uint8_t throttle_percent = 0U;
   bool changed;
 
   if (view == NULL)
@@ -1189,10 +1544,22 @@ static bool UiTask_UpdateMainThrottleView(MainUiView_t *view)
   /* 摇杆快照无效时GetSnapshot会保留零输出，锁图标仍反映控制层状态。 */
   (void)ThrottleControl_GetSnapshot(&snapshot);
 
+  if (snapshot.limit > 0U)
+  {
+    throttle_percent =
+        (uint8_t)((((uint32_t)snapshot.raw_command * 100U) +
+                   (snapshot.limit / 2U)) /
+                  snapshot.limit);
+    if (throttle_percent > 100U)
+    {
+      throttle_percent = 100U;
+    }
+  }
+
   changed = (view->throttle_unlocked != snapshot.unlocked) ||
-            (view->throttle_percent != (uint8_t)snapshot.raw_command);
+            (view->throttle_percent != throttle_percent);
   view->throttle_unlocked = snapshot.unlocked;
-  view->throttle_percent = (uint8_t)snapshot.raw_command;
+  view->throttle_percent = throttle_percent;
   return changed;
 }
 
@@ -1334,6 +1701,253 @@ static void UiTask_PrepareDirectionPageEntry(MotorDirectionUiView_t *view)
   view->focus = MOTOR_DIRECTION_UI_FOCUS_SWITCH;
   view->selected_motor = 1U;
   view->selected_direction = MOTOR_DIRECTION_UI_NORMAL;
+}
+
+/**
+ * @brief 准备每次进入油门页面时的导航状态。
+ *
+ * 通道掩码、LIM和Step不会因离开页面而丢失；只把焦点恢复到ALL并退出
+ * 参数编辑状态。锁、油门值和共享配置从ThrottleControl重新读取。
+ */
+static void UiTask_PrepareThrottlePageEntry(ThrottleUiView_t *view)
+{
+  if (view == NULL)
+  {
+    return;
+  }
+
+  view->focus = THROTTLE_UI_FOCUS_ALL;
+  view->edit_mode = false;
+  if ((view->step != 1U) && (view->step != 10U) &&
+      (view->step != 100U) && (view->step != 1000U))
+  {
+    view->step = 100U;
+  }
+
+  (void)UiTask_UpdateThrottleView(view);
+}
+
+/**
+ * @brief 判断BACK是否应直接把油门页面路由回主页面。
+ *
+ * 长按BACK在任意层级立即返回；短按BACK只有在顶部导航且未编辑参数时
+ * 返回主页面。参数编辑中的短按BACK由页面状态机用于退出编辑，电机层的
+ * 短按BACK用于回到ALL。
+ */
+static bool UiTask_ShouldLeaveThrottlePage(
+    const ThrottleUiView_t *view,
+    const UiInputEvent_t *event)
+{
+  if ((view == NULL) || (event == NULL) ||
+      (event->key_id != KEY_ID_BACK))
+  {
+    return false;
+  }
+
+  if (event->action == UI_INPUT_ACTION_LONG_PRESS)
+  {
+    return true;
+  }
+
+  return (event->action == UI_INPUT_ACTION_SHORT_PRESS) &&
+         !view->edit_mode &&
+         (view->focus <= THROTTLE_UI_FOCUS_STEP);
+}
+
+/**
+ * @brief 推进油门页面焦点、参数编辑和通道掩码状态机。
+ *
+ * 共享配置仅通过ThrottleControl_SetConfiguration()发布；CanTask在下一次
+ * 10 ms油门周期读取快照，把掩码外通道写0。UiTask不直接操作libcanard。
+ */
+static bool UiTask_HandleThrottleInput(ThrottleUiView_t *view,
+                                       const UiInputEvent_t *event)
+{
+  bool configuration_changed = false;
+
+  if ((view == NULL) || (event == NULL) ||
+      ((uint32_t)event->key_id >= (uint32_t)KEY_ID_COUNT))
+  {
+    return false;
+  }
+
+  /* ALL只有长按Confirm才改变全部通道，避免普通确认动作误选8路电机。 */
+  if (event->action == UI_INPUT_ACTION_LONG_PRESS)
+  {
+    if ((event->key_id == KEY_ID_CONFIRM) &&
+        (view->focus == THROTTLE_UI_FOCUS_ALL))
+    {
+      /*
+       * 非零油门时允许一键取消全选，但禁止从部分/全不选扩展为8路，
+       * 防止新通道在选择瞬间带油启动。
+       */
+      if ((view->motor_mask != 0xFFU) && (view->raw_command != 0U))
+      {
+        return false;
+      }
+      view->motor_mask =
+          (view->motor_mask == 0xFFU) ? 0x00U : 0xFFU;
+      configuration_changed = true;
+    }
+    else
+    {
+      return false;
+    }
+  }
+  else if (event->action != UI_INPUT_ACTION_SHORT_PRESS)
+  {
+    return false;
+  }
+  else if (view->edit_mode)
+  {
+    if (view->focus == THROTTLE_UI_FOCUS_LIMIT)
+    {
+      if (event->key_id == KEY_ID_UP)
+      {
+        /* 增大LIM会抬高实际输出，只允许在当前油门为0时执行。 */
+        if (view->raw_command != 0U)
+        {
+          return false;
+        }
+        const uint32_t increased =
+            (uint32_t)view->limit + (uint32_t)view->step;
+        view->limit = (increased > THROTTLE_CONTROL_RAW_COMMAND_MAX)
+                          ? THROTTLE_CONTROL_RAW_COMMAND_MAX
+                          : (uint16_t)increased;
+        configuration_changed = true;
+      }
+      else if (event->key_id == KEY_ID_DOWN)
+      {
+        view->limit = (view->limit > view->step)
+                          ? (uint16_t)(view->limit - view->step)
+                          : 0U;
+        configuration_changed = true;
+      }
+      else if ((event->key_id == KEY_ID_BACK) ||
+               (event->key_id == KEY_ID_CONFIRM))
+      {
+        view->edit_mode = false;
+        return true;
+      }
+      else
+      {
+        return false;
+      }
+    }
+    else if (view->focus == THROTTLE_UI_FOCUS_STEP)
+    {
+      if (event->key_id == KEY_ID_UP)
+      {
+        if (view->step < 10U)       { view->step = 10U; }
+        else if (view->step < 100U) { view->step = 100U; }
+        else                        { view->step = 1000U; }
+        return true;
+      }
+      if (event->key_id == KEY_ID_DOWN)
+      {
+        if (view->step > 100U)     { view->step = 100U; }
+        else if (view->step > 10U) { view->step = 10U; }
+        else                       { view->step = 1U; }
+        return true;
+      }
+      if ((event->key_id == KEY_ID_BACK) ||
+          (event->key_id == KEY_ID_CONFIRM))
+      {
+        view->edit_mode = false;
+        return true;
+      }
+      return false;
+    }
+    else
+    {
+      /* 防御损坏状态：只有LIM和Step允许进入编辑模式。 */
+      view->edit_mode = false;
+      return true;
+    }
+  }
+  else if (view->focus <= THROTTLE_UI_FOCUS_STEP)
+  {
+    if (event->key_id == KEY_ID_UP)
+    {
+      view->focus = (view->focus == THROTTLE_UI_FOCUS_ALL)
+                        ? THROTTLE_UI_FOCUS_STEP
+                        : (ThrottleUiFocus_t)(view->focus - 1);
+      return true;
+    }
+    if (event->key_id == KEY_ID_DOWN)
+    {
+      view->focus = (view->focus == THROTTLE_UI_FOCUS_STEP)
+                        ? THROTTLE_UI_FOCUS_ALL
+                        : (ThrottleUiFocus_t)(view->focus + 1);
+      return true;
+    }
+    if (event->key_id == KEY_ID_CONFIRM)
+    {
+      if (view->focus == THROTTLE_UI_FOCUS_ALL)
+      {
+        /* ALL短按只进入电机层，不改变当前掩码。 */
+        view->focus = THROTTLE_UI_FOCUS_MOTOR_1;
+      }
+      else
+      {
+        view->edit_mode = true;
+      }
+      return true;
+    }
+    return false;
+  }
+  else
+  {
+    uint8_t motor_index =
+        (uint8_t)(view->focus - THROTTLE_UI_FOCUS_MOTOR_1);
+
+    if (event->key_id == KEY_ID_UP)
+    {
+      motor_index = (motor_index == 0U) ? 7U : (uint8_t)(motor_index - 1U);
+      view->focus =
+          (ThrottleUiFocus_t)(THROTTLE_UI_FOCUS_MOTOR_1 + motor_index);
+      return true;
+    }
+    if (event->key_id == KEY_ID_DOWN)
+    {
+      motor_index = (uint8_t)((motor_index + 1U) % 8U);
+      view->focus =
+          (ThrottleUiFocus_t)(THROTTLE_UI_FOCUS_MOTOR_1 + motor_index);
+      return true;
+    }
+    if (event->key_id == KEY_ID_CONFIRM)
+    {
+      const uint8_t motor_bit = (uint8_t)(1UL << motor_index);
+
+      /* 取消通道随时允许；新增通道必须先把实际油门降到0。 */
+      if (((view->motor_mask & motor_bit) == 0U) &&
+          (view->raw_command != 0U))
+      {
+        return false;
+      }
+      view->motor_mask ^= motor_bit;
+      configuration_changed = true;
+    }
+    else if (event->key_id == KEY_ID_BACK)
+    {
+      view->focus = THROTTLE_UI_FOCUS_ALL;
+      return true;
+    }
+    else
+    {
+      return false;
+    }
+  }
+
+  if (configuration_changed)
+  {
+    ThrottleControl_SetConfiguration(view->motor_mask, view->limit);
+    /* 立即重新计算显示值，不必等下一次100 ms周期刷新。 */
+    (void)UiTask_UpdateThrottleView(view);
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -2015,8 +2629,26 @@ static void DirectionLedTimerCallback(void *argument)
  */
 static void DirectionBuzzFeedback(void)
 {
+  BuzzerFeedback_Start(DIRECTION_BUZZ_DURATION_MS);
+}
+
+/**
+ * @brief 非阻塞启动或重启一次蜂鸣提示。
+ *
+ * 方向确认和油门锁切换共用同一个物理蜂鸣器及一次性软件定时器。如果新
+ * 提示到来时蜂鸣器仍在响，就以新时长重新计时，避免两个定时器竞争同一
+ * GPIO，也不会使用HAL_Delay阻塞InputTask或UiTask。
+ */
+static void BuzzerFeedback_Start(uint32_t duration_ms)
+{
   if (DirectionBuzzTimerHandle == NULL)
   {
+    return;
+  }
+
+  if (duration_ms == 0U)
+  {
+    HAL_GPIO_WritePin(Buzz_GPIO_Port, Buzz_Pin, GPIO_PIN_RESET);
     return;
   }
 
@@ -2030,10 +2662,10 @@ static void DirectionBuzzFeedback(void)
                       Buzz_Pin,
                       GPIO_PIN_SET);
 
-  /* 启动一次性定时器，达到配置的400 ms后自动熄灭蜂鸣器。 */
+  /* 启动一次性定时器，达到调用方指定时间后自动熄灭蜂鸣器。 */
   if (osTimerStart(
           DirectionBuzzTimerHandle,
-          pdMS_TO_TICKS(DIRECTION_BUZZ_DURATION_MS)) != osOK)
+          pdMS_TO_TICKS(duration_ms)) != osOK)
   {
     /* 启动失败时立即熄灭蜂鸣器，避免长鸣。 */
     HAL_GPIO_WritePin(Buzz_GPIO_Port,
@@ -2041,6 +2673,20 @@ static void DirectionBuzzFeedback(void)
                       GPIO_PIN_RESET);
   }
 
+}
+
+/**
+ * @brief 同步油门锁的实体LED，并为一次成功切换产生100 ms提示音。
+ *
+ * 油门LED为低电平有效：解锁写RESET持续点亮，关锁写SET立即熄灭。
+ * 本函数由InputTask在锁状态已经成功改变后调用，不负责修改软件锁状态。
+ */
+static void ThrottleLockHardwareFeedback(bool unlocked)
+{
+  HAL_GPIO_WritePin(Throttle_LED_GPIO_Port,
+                    Throttle_LED_Pin,
+                    unlocked ? GPIO_PIN_RESET : GPIO_PIN_SET);
+  BuzzerFeedback_Start(THROTTLE_LOCK_BUZZ_DURATION_MS);
 }
 
 
