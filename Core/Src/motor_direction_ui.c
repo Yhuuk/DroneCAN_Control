@@ -1,6 +1,7 @@
 #include "motor_direction_ui.h"
 
 #include "lcd_init.h"
+#include "spi1_bus.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -789,6 +790,13 @@ static void MotorDirectionUI_DrawLogicalRegion(
         physical_right = LCD_W - 1U;
     }
 
+    /* 地址窗口与其后全部像素必须连续，禁止FRAM事务插入其中。 */
+    if (SPI1_Bus_Acquire() != HAL_OK)
+    {
+        Error_Handler();
+        return;
+    }
+
     LCD_Address_Set(physical_left,
                     physical_top,
                     physical_right,
@@ -817,6 +825,8 @@ static void MotorDirectionUI_DrawLogicalRegion(
 
         LCD_WriteDataBuffer(g_ui_physical_row_buffer, buffer_index);
     }
+
+    SPI1_Bus_Release();
 }
 
 /** @brief 用当前视图内容重画某个旧/新焦点可能覆盖的最小区域。 */

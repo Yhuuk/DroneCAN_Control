@@ -1,6 +1,7 @@
 #include "main_ui.h"
 
 #include "lcd_init.h"
+#include "spi1_bus.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -783,6 +784,13 @@ static void MainUI_DrawLogicalRegion(const MainUiView_t *view,
         physical_right = LCD_W - 1U;
     }
 
+    /* 地址窗口与其后全部像素必须连续，禁止FRAM事务插入其中。 */
+    if (SPI1_Bus_Acquire() != HAL_OK)
+    {
+        Error_Handler();
+        return;
+    }
+
     LCD_Address_Set(physical_left,
                     physical_top,
                     physical_right,
@@ -814,6 +822,8 @@ static void MainUI_DrawLogicalRegion(const MainUiView_t *view,
 
         LCD_WriteDataBuffer(g_main_ui_physical_row_buffer, buffer_index);
     }
+
+    SPI1_Bus_Release();
 }
 
 void MainUI_Draw(const MainUiView_t *view)

@@ -30,6 +30,7 @@
 /* USER CODE BEGIN Includes */
 #include "joystick.h"
 #include "lcd_init.h"
+#include "fram.h"
 
 /* USER CODE END Includes */
 
@@ -158,6 +159,14 @@ int main(void)
   {
     Error_Handler();
   }
+
+  /*
+   * 此处FreeRTOS尚未启动，系统只有main()一个执行流，因此共享SPI总线
+   * 接口会安全地跳过互斥锁。FRAM_Init仅识别器件和检查写保护状态，不会
+   * 改写用户数据；结果可通过g_fram_initialized在调试器中观察。
+   * FRAM暂时不是系统启动的强制依赖，识别失败时仍允许LCD/CAN继续运行。
+   */
+  (void)FRAM_Init();
 
   LCD_Init();
 

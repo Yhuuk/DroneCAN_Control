@@ -1,5 +1,6 @@
 #include "lcd_init.h"
 #include "spi.h"
+#include "spi1_bus.h"
 
 /* 单次 HAL 发送的超时时间。屏幕只写不读，正常情况下会立即完成。 */
 #define LCD_SPI_TIMEOUT_MS 100U
@@ -142,8 +143,15 @@ void LCD_Fill(uint16_t xs, uint16_t ys, uint16_t xe, uint16_t ye, uint16_t color
         return;
     }
 
+    if (SPI1_Bus_Acquire() != HAL_OK)
+    {
+        Error_Handler();
+        return;
+    }
+
     LCD_Address_Set(xs, ys, xe - 1, ye - 1);
     LCD_WriteColorRepeat(color, (uint32_t)(xe - xs) * (uint32_t)(ye - ys));
+    SPI1_Bus_Release();
 }
 
 /**
@@ -162,6 +170,13 @@ void LCD_Init(void)
     HAL_Delay(250U);
     HAL_GPIO_WritePin(OLED_RST_GPIO_Port, OLED_RST_Pin, GPIO_PIN_SET);
     HAL_Delay(250U);
+
+    /* 从第一条初始化命令到最后一条命令视为一个完整OLED事务。 */
+    if (SPI1_Bus_Acquire() != HAL_OK)
+    {
+        Error_Handler();
+        return;
+    }
 
     LCD_WR_REG(0xC0);
     LCD_WR_DATA8(0x5A);
@@ -2372,6 +2387,7 @@ void LCD_Init(void)
     HAL_Delay(25U);
     LCD_WR_REG(0x29);
     LCD_WR_REG(0x39);
+    SPI1_Bus_Release();
 }
 
 

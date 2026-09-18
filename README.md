@@ -69,3 +69,33 @@ cmake --build --preset Release --target DrondCAN_Control
 ```
 
 **说明**: 目前`tasks.json` 中配置的`编译、烧录` 快捷键是 `Debug`，所以如果使用 `Release` 就可以使用上面的指令完成
+
+## 调试
+1. 打开命令面板`Ctrl+Shift+P`,执行 `Cortex-Debug: Toggle hex display in Variables window`,就可以在`Cortex Live Watch`窗口中观察到`16进制`显示
+
+
+## `FRAM` 的使用说明
+1. MB85RS16状态寄存器主要包含：
+
+| 位 | 名称 | 含义 |
+|---|---|---|
+| bit7 | WPEN | 是否启用硬件WP引脚对状态寄存器的写保护 |
+| bit6～4 | 固定/保留 | 一般读取为0 |
+| bit3 | BP1 | 存储区块保护位 |
+| bit2 | BP0 | 存储区块保护位 |
+| bit1 | WEL | 写使能锁存位 |
+| bit0 | 固定/保留 | 一般读取为0 |
+
+```text
+WEL = 0：当前不允许写
+WEL = 1：已经执行WREN，允许进行下一次写入
+```
+执行`WREN`,`WEL`应该变成`1`。完成一次`WRITE`后，`WEL`自动变回`0`。
+
+`BP1/BP0` 用来保护FRAM的部分或全部存储空间
+```text
+BP1 BP0 = 00：整个FRAM都可以写
+BP1 BP0 = 01：顶部一部分受保护
+BP1 BP0 = 10：顶部一半受保护
+BP1 BP0 = 11：全部受保护
+```

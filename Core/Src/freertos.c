@@ -322,6 +322,11 @@ const osThreadAttr_t InputTask_attributes = {
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+/* Definitions for SPI1BusMutex */
+osMutexId_t SPI1BusMutexHandle;
+const osMutexAttr_t SPI1BusMutex_attributes = {
+  .name = "SPI1BusMutex"
+};
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -440,6 +445,9 @@ void MX_FREERTOS_Init(void) {
   ThrottleControl_Init();
 
   /* USER CODE END Init */
+  /* Create the mutex(es) */
+  /* creation of SPI1BusMutex */
+  SPI1BusMutexHandle = osMutexNew(&SPI1BusMutex_attributes);
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
