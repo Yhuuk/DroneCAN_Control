@@ -25,6 +25,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "app_settings.h"
 #include "app_messages.h"
 #include "can_port.h"
 #include "dronecan_config.h"
@@ -152,6 +153,9 @@ typedef enum
 
 /** 精确油门数字以20 Hz刷新，避免数字跳动过快且降低无效绘制量。 */
 #define THROTTLE_UI_VALUE_REFRESH_PERIOD_MS 50U
+
+/** LIM/STEP停止变化5秒后自动保存；退出参数编辑时还会立即保存。 */
+#define APP_SETTINGS_AUTOSAVE_DELAY_MS 5000U
 
 /** 以100 Hz周期广播最新8路油门目标，与InputTask的10 ms快照周期一致。 */
 #define THROTTLE_RAW_COMMAND_PUBLISH_PERIOD_MS 10U
@@ -441,8 +445,20 @@ void vApplicationMallocFailedHook(void)
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
 
+  AppSettings_t stored_settings;
+
   /* 在任何任务访问共享油门状态前，先明确置为锁定和零输出。 */
   ThrottleControl_Init();
+
+  /*
+   * AppSettings已在main()、FreeRTOS启动前从FRAM加载。这里把掉电保存的
+   * LIM发布到控制层，确保CanTask第一次读取快照时就是恢复后的限制值。
+   * 电机MASK属于本次运行的安全选择，上电仍固定恢复为0，不做掉电保存。
+   */
+  AppSettings_Get(&stored_settings);
+  ThrottleControl_SetConfiguration(
+      THROTTLE_CONTROL_DEFAULT_MOTOR_MASK,
+      stored_settings.throttle_limit);
 
   /* USER CODE END Init */
   /* Create the mutex(es) */
@@ -640,6 +656,7 @@ void StartUiTask(void *argument)
       .pending_token = 0U,
       .next_token = 1U
   };
+  AppSettings_t persistent_settings;
 
   //定义 一个Ui事件消息结构体 变量
   UiEventMessage_t event_message;
@@ -654,6 +671,11 @@ void StartUiTask(void *argument)
   osStatus_t queue_status;
 
   (void)argument;
+
+  /* 把开机从FRAM恢复的LIM/STEP应用到油门页面本地视图。 */
+  AppSettings_Get(&persistent_settings);
+  throttle_view.limit = persistent_settings.throttle_limit;
+  throttle_view.step = persistent_settings.throttle_step;
 
   /* 读取控制层的安全初值，确保主页面锁图标与实际输出状态一致。 */
   (void)UiTask_UpdateMainThrottleView(&main_view);
@@ -680,6 +702,12 @@ void StartUiTask(void *argument)
      * 因此即使期间不断收到按键消息，40/50 ms显示周期也不会被重新起算。
      */
     uint32_t now_tick = osKernelGetTickCount();
+
+    /*
+     * 只有5秒截止时间到达时才真正访问FRAM。保存失败会保留pending状态，
+     * 存储模块按1秒间隔重试，不会在本循环中无间隔反复占用SPI1。
+     */
+    (void)AppSettings_ProcessDeferredSave(now_tick);
 
     if ((current_page == UI_PAGE_MAIN) &&
         ((int32_t)(now_tick - next_main_refresh_tick) >= 0))
@@ -787,6 +815,19 @@ void StartUiTask(void *argument)
     {
       /* 方向页面没有连续显示项，可以永久等待下一条UI消息。 */
       queue_wait_ticks = osWaitForever;
+    }
+
+    /*
+     * 即使当前位于没有周期刷新的方向页，也不能永久睡眠而错过配置保存。
+     * 将配置截止时间合并为UiTask本次队列等待的最短超时。
+     */
+    {
+      const uint32_t settings_wait_ticks =
+          AppSettings_TicksUntilSave(now_tick);
+      if (settings_wait_ticks < queue_wait_ticks)
+      {
+        queue_wait_ticks = settings_wait_ticks;
+      }
     }
 
     queue_status = osMessageQueueGet(
@@ -968,6 +1009,19 @@ void StartUiTask(void *argument)
 
           if (UiTask_ShouldLeaveThrottlePage(&throttle_view, input))
           {
+            /*
+             * 长按BACK可能从参数编辑层直接离开页面。若有尚未提交的
+             * LIM/STEP变化，此处采用第二种“明确退出时立即保存”方式。
+             */
+            if (AppSettings_IsSavePending())
+            {
+              persistent_settings.throttle_limit = throttle_view.limit;
+              persistent_settings.throttle_step = throttle_view.step;
+              (void)AppSettings_SaveNow(
+                  &persistent_settings,
+                  osKernelGetTickCount());
+            }
+
             main_view.focus = MAIN_UI_FOCUS_THROTTLE;
             current_page = UI_PAGE_MAIN;
             (void)UiTask_UpdateMainThrottleView(&main_view);
@@ -986,6 +1040,38 @@ void StartUiTask(void *argument)
           }
           else if (UiTask_HandleThrottleInput(&throttle_view, input))
           {
+            const bool parameter_changed =
+                (previous_throttle_view.limit != throttle_view.limit) ||
+                (previous_throttle_view.step != throttle_view.step);
+            const bool parameter_edit_finished =
+                previous_throttle_view.edit_mode &&
+                !throttle_view.edit_mode;
+
+            if (parameter_changed)
+            {
+              /*
+               * 每次UP/DOWN都只更新RAM并把截止时间推迟5秒；连续调节
+               * 不会产生连续FRAM写入，停止变化后才自动保存最新值。
+               */
+              persistent_settings.throttle_limit = throttle_view.limit;
+              persistent_settings.throttle_step = throttle_view.step;
+              AppSettings_RequestDeferredSave(
+                  &persistent_settings,
+                  osKernelGetTickCount(),
+                  pdMS_TO_TICKS(APP_SETTINGS_AUTOSAVE_DELAY_MS));
+            }
+
+            if (parameter_edit_finished &&
+                AppSettings_IsSavePending())
+            {
+              /* 短按Confirm或BACK退出LIM/STEP编辑时立即保存。 */
+              persistent_settings.throttle_limit = throttle_view.limit;
+              persistent_settings.throttle_step = throttle_view.step;
+              (void)AppSettings_SaveNow(
+                  &persistent_settings,
+                  osKernelGetTickCount());
+            }
+
             refresh_start_tick = osKernelGetTickCount();
             ThrottleUI_Update(&previous_throttle_view, &throttle_view);
             refresh_duration = osKernelGetTickCount() - refresh_start_tick;

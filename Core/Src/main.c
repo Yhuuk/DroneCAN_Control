@@ -31,6 +31,7 @@
 #include "joystick.h"
 #include "lcd_init.h"
 #include "fram.h"
+#include "app_settings.h"
 
 /* USER CODE END Includes */
 
@@ -167,6 +168,12 @@ int main(void)
    * FRAM暂时不是系统启动的强制依赖，识别失败时仍允许LCD/CAN继续运行。
    */
   (void)FRAM_Init();
+
+  /*
+   * 从FRAM的A/B记录加载LIM和STEP。读取失败时模块内部保留安全默认值，
+   * 不阻止LCD和CAN启动；首次使用会自动建立一条默认配置记录。
+   */
+  (void)AppSettings_Init();
 
   LCD_Init();
 

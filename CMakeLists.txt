@@ -53,6 +53,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/joystick.c
     Core/Src/spi1_bus.c
     Core/Src/fram.c
+    Core/Src/app_settings.c
     Core/Src/throttle_control.c
     Core/Src/main_ui.c
     Core/Src/motor_direction_ui.c
