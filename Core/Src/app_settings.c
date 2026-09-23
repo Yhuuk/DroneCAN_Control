@@ -18,6 +18,10 @@
 #define APP_SETTINGS_PAYLOAD_LENGTH            4U
 #define APP_SETTINGS_COMMIT_MARKER              0xA55AC33CUL
 
+/**
+ *以下是每个字段的偏移
+ 记录空间的格式: 固定标识，格式版本，载荷长度，保存序号，用户数据空间(LIM,STEP)，CRC32校验，有效标记提交
+ */
 #define APP_SETTINGS_MAGIC_OFFSET               0U
 #define APP_SETTINGS_VERSION_OFFSET             4U
 #define APP_SETTINGS_PAYLOAD_LENGTH_OFFSET      6U
@@ -52,6 +56,13 @@ typedef struct
     AppSettings_t settings;
 } AppSettingsDecodedRecord_t;
 
+/**
+ * g_current_settings 表示 最新希望保存的内存值，
+ * g_saved_settings 表示 上次已确认写入的值
+ * g_save_pending 表示RAM中的配置是否等待保存，修改参数时置true
+ * g_save_deadline_tick 下一次允许尝试自动保存的FreeRTOS时刻，每次修改设为"现在+5秒"，保存失败为"现在+1秒"重试
+ * 
+ */
 static AppSettings_t g_current_settings;
 static AppSettings_t g_saved_settings;
 static bool g_active_record_valid;
@@ -139,10 +150,16 @@ static uint32_t AppSettings_Crc32(const uint8_t *data, uint16_t length)
         {
             if ((crc & 1UL) != 0UL)
             {
+                /**
+                 * 该位为1，就进行(crc >> 1U) ^ 0xEDB88320UL计算
+                 */
                 crc = (crc >> 1U) ^ 0xEDB88320UL;
             }
             else
             {
+                /**
+                 * 该位为0，就向右移一位
+                 */
                 crc >>= 1U;
             }
         }
@@ -387,7 +404,9 @@ HAL_StatusTypeDef AppSettings_Init(void)
     g_app_settings_save_error_count = 0UL;
     g_app_settings_crc_error_count = 0UL;
 
-    /* 防止CRC参数被将来误改；标准测试结果不匹配时拒绝使用记录。 */
+    /* 防止CRC参数被将来误改；标准测试结果不匹配时拒绝使用记录。
+       sizeof(crc_test_data) - 1U，减去的是C字符串结尾的`\0`
+    */
     if (AppSettings_Crc32(crc_test_data,
                           (uint16_t)(sizeof(crc_test_data) - 1U)) !=
         0xCBF43926UL)
@@ -513,6 +532,9 @@ uint32_t AppSettings_TicksUntilSave(uint32_t now_tick)
     return (remaining <= 0) ? 0U : (uint32_t)remaining;
 }
 
+/**
+ * 返回true表示正在修改
+ */
 bool AppSettings_IsSavePending(void)
 {
     return g_save_pending;

@@ -35,7 +35,10 @@ volatile uint32_t g_fram_write_count = 0U;
 volatile uint32_t g_fram_error_count = 0U;
 
 /**
- * 该ID 是器件类型和厂商识别信息
+ * 该ID 是器件类型和厂商识别信息，这个是MB85RS16的
+ * 
+ * MB85RS256B 的device_id 为04 7F 05 09
+ * 所以但我使用MB85RS256B这款的时候，就不能在初始化中以读取到的ID为是为初始化的标准之一
  */
 static const uint8_t g_fram_expected_device_id[FRAM_DEVICE_ID_LENGTH] = {
     0x04U, 0x7FU, 0x01U, 0x01U
@@ -309,14 +312,15 @@ HAL_StatusTypeDef FRAM_Init(void)
     }
     /**
      *判断读取到的ID是否是 04 7F 01 01
+     *这是我MB85RS16的ID,现在我两块板子上的FRAM大小不同，所以ID不用，这里就不能使用获取到的ID进行初始化。
      */
-    if (memcmp(device_id,
-               g_fram_expected_device_id,
-               FRAM_DEVICE_ID_LENGTH) != 0)
-    {
-        ++g_fram_error_count;
-        return HAL_ERROR;
-    }
+    // if (memcmp(device_id,
+    //            g_fram_expected_device_id,
+    //            FRAM_DEVICE_ID_LENGTH) != 0)
+    // {
+    //     ++g_fram_error_count;
+    //     return HAL_ERROR;
+    // }
 
     if (FRAM_ReadStatus(&status_register) != HAL_OK)
     {
