@@ -27,11 +27,13 @@
 /* USER CODE BEGIN Includes */
 #include "app_settings.h"
 #include "app_messages.h"
+#include "brightness_ui.h"
 #include "can_port.h"
 #include "dronecan_config.h"
 #include "dronecan_node.h"
 #include "joystick.h"
 #include "key_input.h"
+#include "lcd_init.h"
 #include "main_ui.h"
 #include "motor_direction_ui.h"
 #include "throttle_control.h"
@@ -102,12 +104,14 @@ typedef struct
   uint32_t overall_deadline_tick;
 } CanDirectionQueryControl_t;
 
-/** @brief UiTask当前显示的页面；目前主页面和电机方向页面已经接通。 */
+/** @brief UiTask当前显示的页面。 */
 typedef enum
 {
   UI_PAGE_MAIN = 0,
   UI_PAGE_MOTOR_DIRECTION,
-  UI_PAGE_THROTTLE
+  UI_PAGE_THROTTLE,
+  /** 主页面第4个“状态”入口暂时承载OLED亮度测试页面。 */
+  UI_PAGE_BRIGHTNESS
 } UiPage_t;
 
 /**
@@ -153,6 +157,9 @@ typedef enum
 
 /** 精确油门数字以20 Hz刷新，避免数字跳动过快且降低无效绘制量。 */
 #define THROTTLE_UI_VALUE_REFRESH_PERIOD_MS 50U
+
+/** 亮度测试页每次短按UP/DOWN改变约6.3%，并在0和255处饱和。 */
+#define BRIGHTNESS_UI_ADJUST_STEP 16U
 
 /** LIM/STEP停止变化5秒后自动保存；退出参数编辑时还会立即保存。 */
 #define APP_SETTINGS_AUTOSAVE_DELAY_MS 5000U
@@ -303,6 +310,9 @@ volatile uint32_t g_direction_auto_query_scheduled_count;
 volatile uint32_t g_direction_auto_query_started_count;
 /** 自动查询到期事件因UiEventQueue满而丢失的次数。 */
 volatile uint32_t g_direction_auto_query_event_drop_count;
+/** 最近一次成功发送给SH8501A的0~255亮度值及发送失败次数。 */
+volatile uint8_t g_lcd_brightness = 0xFFU;
+volatile uint32_t g_lcd_brightness_error_count;
 
 /* USER CODE END Variables */
 /* Definitions for UiTask */
@@ -345,6 +355,8 @@ static bool UiTask_UpdateThrottleView(ThrottleUiView_t *view);
 static bool UiTask_UpdateMainThrottleView(MainUiView_t *view);
 static bool UiTask_HandleMainInput(MainUiView_t *view,
                                    const UiInputEvent_t *event);
+static bool UiTask_HandleBrightnessInput(BrightnessUiView_t *view,
+                                         const UiInputEvent_t *event);
 static void UiTask_PrepareDirectionPageEntry(MotorDirectionUiView_t *view);
 static void UiTask_PrepareThrottlePageEntry(ThrottleUiView_t *view);
 static bool UiTask_ShouldLeaveThrottlePage(
@@ -629,6 +641,9 @@ void StartUiTask(void *argument)
       .raw_command = 0U,
       .throttle_percent = 0U,
       .focus = THROTTLE_UI_FOCUS_ALL
+  };
+  BrightnessUiView_t brightness_view = {
+      .brightness = 0xFFU
   };
   MotorDirectionUiView_t view = {
       .power_state = MOTOR_DIRECTION_UI_POWER_OFF,
@@ -934,9 +949,27 @@ void StartUiTask(void *argument)
                 break;
 
               case MAIN_UI_FOCUS_SETTINGS:
+                /* 设置页面尚未设计，Confirm暂时保持在主页面。 */
+                break;
+
               case MAIN_UI_FOCUS_STATUS:
+                /*
+                 * 第4个状态入口临时作为亮度测试入口。亮度值在UiTask整个
+                 * 生命周期内保留，离开再进入不会自动恢复到最大值。
+                 */
+                current_page = UI_PAGE_BRIGHTNESS;
+                refresh_start_tick = osKernelGetTickCount();
+                BrightnessUI_Draw(&brightness_view);
+                refresh_duration =
+                    osKernelGetTickCount() - refresh_start_tick;
+                g_ui_last_refresh_time_ms = refresh_duration;
+                if (refresh_duration > g_ui_max_refresh_time_ms)
+                {
+                  g_ui_max_refresh_time_ms = refresh_duration;
+                }
+                break;
+
               default:
-                /* 对应页面尚未设计，Confirm暂时保持在主页面且不刷新。 */
                 break;
             }
           }
@@ -1074,6 +1107,45 @@ void StartUiTask(void *argument)
 
             refresh_start_tick = osKernelGetTickCount();
             ThrottleUI_Update(&previous_throttle_view, &throttle_view);
+            refresh_duration = osKernelGetTickCount() - refresh_start_tick;
+            g_ui_last_refresh_time_ms = refresh_duration;
+            if (refresh_duration > g_ui_max_refresh_time_ms)
+            {
+              g_ui_max_refresh_time_ms = refresh_duration;
+            }
+          }
+        }
+        else if (current_page == UI_PAGE_BRIGHTNESS)
+        {
+          const BrightnessUiView_t previous_brightness_view =
+              brightness_view;
+
+          if ((input->key_id == KEY_ID_BACK) &&
+              ((input->action == UI_INPUT_ACTION_SHORT_PRESS) ||
+               (input->action == UI_INPUT_ACTION_LONG_PRESS)))
+          {
+            /* 简单测试页没有子层级，短按或长按BACK都直接返回主页面。 */
+            main_view.focus = MAIN_UI_FOCUS_STATUS;
+            current_page = UI_PAGE_MAIN;
+            (void)UiTask_UpdateMainThrottleView(&main_view);
+
+            refresh_start_tick = osKernelGetTickCount();
+            MainUI_Draw(&main_view);
+            refresh_duration = osKernelGetTickCount() - refresh_start_tick;
+            g_ui_last_refresh_time_ms = refresh_duration;
+            if (refresh_duration > g_ui_max_refresh_time_ms)
+            {
+              g_ui_max_refresh_time_ms = refresh_duration;
+            }
+            next_main_refresh_tick =
+                osKernelGetTickCount() +
+                pdMS_TO_TICKS(MAIN_UI_REFRESH_PERIOD_MS);
+          }
+          else if (UiTask_HandleBrightnessInput(&brightness_view, input))
+          {
+            refresh_start_tick = osKernelGetTickCount();
+            BrightnessUI_Update(&previous_brightness_view,
+                                &brightness_view);
             refresh_duration = osKernelGetTickCount() - refresh_start_tick;
             g_ui_last_refresh_time_ms = refresh_duration;
             if (refresh_duration > g_ui_max_refresh_time_ms)
@@ -1775,6 +1847,59 @@ static bool UiTask_HandleMainInput(MainUiView_t *view,
   }
 
   return false;
+}
+
+/**
+ * @brief 处理临时亮度页面的UP/DOWN短按并立即写入SH8501A。
+ *
+ * 页面只修改OLED控制器的全局DBV，不修改任何RGB565显存内容。先确认
+ * 0x51指令发送成功，再提交新的页面状态，避免显示值与硬件亮度不一致。
+ *
+ * @return true表示亮度成功变化，需要局部刷新页面。
+ */
+static bool UiTask_HandleBrightnessInput(BrightnessUiView_t *view,
+                                         const UiInputEvent_t *event)
+{
+  uint8_t target;
+
+  if ((view == NULL) || (event == NULL) ||
+      (event->action != UI_INPUT_ACTION_SHORT_PRESS))
+  {
+    return false;
+  }
+
+  target = view->brightness;
+  if (event->key_id == KEY_ID_UP)
+  {
+    target = (target > (uint8_t)(0xFFU - BRIGHTNESS_UI_ADJUST_STEP))
+                 ? 0xFFU
+                 : (uint8_t)(target + BRIGHTNESS_UI_ADJUST_STEP);
+  }
+  else if (event->key_id == KEY_ID_DOWN)
+  {
+    target = (target < BRIGHTNESS_UI_ADJUST_STEP)
+                 ? 0U
+                 : (uint8_t)(target - BRIGHTNESS_UI_ADJUST_STEP);
+  }
+  else
+  {
+    return false;
+  }
+
+  if (target == view->brightness)
+  {
+    return false;
+  }
+
+  if (LCD_SetBrightness(target) != HAL_OK)
+  {
+    ++g_lcd_brightness_error_count;
+    return false;
+  }
+
+  view->brightness = target;
+  g_lcd_brightness = target;
+  return true;
 }
 
 /**

@@ -4,6 +4,7 @@
 
 /* 单次 HAL 发送的超时时间。屏幕只写不读，正常情况下会立即完成。 */
 #define LCD_SPI_TIMEOUT_MS 100U
+#define LCD_CMD_WRITE_DISPLAY_BRIGHTNESS 0x51U
 
 /**
  * @brief 通过 SPI1 阻塞发送一个字节。
@@ -71,6 +72,24 @@ void LCD_WR_DATA(uint16_t data)
     };
 
     LCD_WriteDataBuffer(pixel_bytes, (uint16_t)sizeof(pixel_bytes));
+}
+
+HAL_StatusTypeDef LCD_SetBrightness(uint8_t brightness)
+{
+    /*
+     * 0x51命令和它的DBV参数属于一个完整的逻辑操作。整个操作期间持有
+     * SPI1互斥锁，防止OLED显存刷新或FRAM事务插入两个字节之间。
+     */
+    if (SPI1_Bus_Acquire() != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    LCD_WR_REG(LCD_CMD_WRITE_DISPLAY_BRIGHTNESS);
+    LCD_WR_DATA8(brightness);
+
+    SPI1_Bus_Release();
+    return HAL_OK;
 }
 
 /**
@@ -2383,6 +2402,13 @@ void LCD_Init(void)
 
     LCD_WR_REG(0x53);
     LCD_WR_DATA8(0x20);
+
+    /*
+     * 0x53/0x20已经启用亮度控制模块。显式写入最大DBV，使软件保存的
+     * 初始亮度状态与屏幕上电状态一致，后续可由LCD_SetBrightness修改。
+     */
+    LCD_WR_REG(LCD_CMD_WRITE_DISPLAY_BRIGHTNESS);
+    LCD_WR_DATA8(0xFF);
 
     HAL_Delay(25U);
     LCD_WR_REG(0x29);

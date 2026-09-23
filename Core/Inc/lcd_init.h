@@ -40,6 +40,18 @@ extern "C" {
 /** 初始化屏幕控制器。调用前必须完成 MX_GPIO_Init() 和 MX_SPI1_Init()。 */
 void LCD_Init(void);
 
+/**
+ * @brief 设置SH8501A的全局显示亮度。
+ *
+ * 该接口发送WRDISBV(0x51)及一个8位DBV参数。0x00表示最低亮度，
+ * 0xFF表示最高亮度；具体亮度与DBV之间的非线性关系由屏幕模组决定。
+ * 函数内部会获取SPI1总线互斥锁，调用者不能在已经持有该锁时调用。
+ *
+ * @param brightness 0x00~0xFF全局亮度控制值。
+ * @retval HAL_OK 指令已经发送；HAL_ERROR 无法获得SPI1总线。
+ */
+HAL_StatusTypeDef LCD_SetBrightness(uint8_t brightness);
+
 /** 设置包含端点的显示窗口，并进入显存写入模式。 */
 void LCD_Address_Set(uint16_t xs, uint16_t ys, uint16_t xe, uint16_t ye);
 
