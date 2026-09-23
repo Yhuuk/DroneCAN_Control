@@ -3,6 +3,7 @@
 #include "lcd_init.h"
 #include "throttle_ui_asset.h"
 #include "spi1_bus.h"
+#include "ui_static_asset.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -35,7 +36,6 @@
 #define THROTTLE_UI_ALL_FOCUS_RADIUS             6U
 #define THROTTLE_UI_ALL_FOCUS_BORDER_WIDTH       3U
 #define THROTTLE_UI_TOP_FOCUS_BORDER_WIDTH      2U
-#define THROTTLE_UI_BAR_BORDER_WIDTH            2U
 
 #define THROTTLE_UI_COLOR_BACKGROUND  0x0F9EU /* SVG #0BF1F5 */
 #define THROTTLE_UI_COLOR_FOREGROUND  BLACK   /** #f800ba */
@@ -45,9 +45,6 @@
 #define THROTTLE_UI_COLOR_TOP_FOCUS   YELLOW  /* 与主界面保持一致的导航焦点 */
 #define THROTTLE_UI_COLOR_MOTOR_FOCUS 0xF817  /** #f800ba ，区别于琥珀色选中背景 */
 #define THROTTLE_UI_COLOR_EDIT_FOCUS  WHITE
-#define THROTTLE_UI_COLOR_UNSELECTED  0xF7BEU /* 保留原图浅灰白背景 */
-#define THROTTLE_UI_COLOR_SELECTED    0xFED8 /* 浅桃色，避免与ALL绿色混淆 */
-#define THROTTLE_UI_COLOR_THROTTLE_TEXT    BLACK
 #define THROTTLE_UI_COLOR_THROTTLE_FILL  0xFA8BU
 
 /*
@@ -62,6 +59,23 @@
 #define THROTTLE_UI_RAW_VALUE_TOP    101U
 #define THROTTLE_UI_RAW_VALUE_RIGHT  159U
 #define THROTTLE_UI_RAW_VALUE_BOTTOM 116U
+
+/**
+ * @brief 油门页面区域刷新所需的动态图层集合。
+ *
+ * 优化三“动态元素专用局部刷新”：不同调用点明确选择顶部参数、电机、
+ * 进度条、精确数值等绘制器，避免一个很小的窗口仍执行整页判断链。
+ */
+typedef enum
+{
+    THROTTLE_UI_RENDER_FULL = 0,
+    THROTTLE_UI_RENDER_TOP,
+    THROTTLE_UI_RENDER_MOTOR,
+    THROTTLE_UI_RENDER_LOCK,
+    THROTTLE_UI_RENDER_BAR,
+    THROTTLE_UI_RENDER_RAW_VALUE,
+    THROTTLE_UI_RENDER_MASK
+} ThrottleUiRenderMode_t;
 
 #if defined(__GNUC__)
 #define THROTTLE_UI_MAYBE_UNUSED __attribute__((unused))
@@ -563,45 +577,96 @@ static bool ThrottleUI_FocusPixel(uint16_t x,
 }
 
 /**
- * @brief 用原稿灰度轮廓在指定背景上合成电机图标。
+ * @brief 用坐标直接定位一个电机图标，避免每像素循环检查8路电机。
  *
- * 这样通道选中时只替换浅色背景为琥珀色，齿轮、数字和抗锯齿边缘仍来自
- * 原SVG图标，不会因为状态变化重新用几何图形近似。
+ * 优化一“区域判断优化”：先用Y坐标确定上下排，再用互不重叠的X区间
+ * 直接得到唯一通道。空隙像素立即返回，最坏也只是4次范围判断。
+ */
+static bool ThrottleUI_GetMotorIndexAtPixel(uint16_t x,
+                                             uint16_t y,
+                                             uint8_t *motor_index)
+{
+    uint8_t row_offset;
+
+    if (motor_index == NULL)
+    {
+        return false;
+    }
+
+    if ((y >= 29U) && (y < (29U + THROTTLE_UI_MOTOR_ICON_HEIGHT)))
+    {
+        row_offset = 0U;
+    }
+    else if ((y >= 66U) &&
+             (y < (66U + THROTTLE_UI_MOTOR_ICON_HEIGHT)))
+    {
+        row_offset = 4U;
+    }
+    else
+    {
+        return false;
+    }
+
+    if ((x >= 24U) && (x < (24U + THROTTLE_UI_MOTOR_ICON_WIDTH)))
+    {
+        *motor_index = row_offset;
+    }
+    else if ((x >= 79U) &&
+             (x < (79U + THROTTLE_UI_MOTOR_ICON_WIDTH)))
+    {
+        *motor_index = (uint8_t)(row_offset + 1U);
+    }
+    else if ((x >= g_motor_icon_x[row_offset + 2U]) &&
+             (x < (g_motor_icon_x[row_offset + 2U] +
+                   THROTTLE_UI_MOTOR_ICON_WIDTH)))
+    {
+        *motor_index = (uint8_t)(row_offset + 2U);
+    }
+    else if ((x >= 188U) &&
+             (x < (188U + THROTTLE_UI_MOTOR_ICON_WIDTH)))
+    {
+        *motor_index = (uint8_t)(row_offset + 3U);
+    }
+    else
+    {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief 用原稿灰度轮廓和Flash查找表合成一个电机图标像素。
+ *
+ * 原SVG的0~255灰度仍然决定齿轮、数字和抗锯齿边缘；区别只是把原先每
+ * 像素三次乘法/除法改为一次Flash查表。[0]是未选中底色，[1]是选中
+ * 底色，因此页面外观和选择逻辑不变。
  */
 static bool ThrottleUI_GetMotorIconPixel(uint16_t x,
                                          uint16_t y,
                                          const ThrottleUiView_t *view,
                                          uint16_t *color)
 {
-    for (uint8_t index = 0U; index < 8U; ++index)
-    {
-        if ((x >= g_motor_icon_x[index]) &&
-            (x < (g_motor_icon_x[index] + THROTTLE_UI_MOTOR_ICON_WIDTH)) &&
-            (y >= g_motor_icon_y[index]) &&
-            (y < (g_motor_icon_y[index] + THROTTLE_UI_MOTOR_ICON_HEIGHT)))
-        {
-            const uint16_t local_x = x - g_motor_icon_x[index];
-            const uint16_t local_y = y - g_motor_icon_y[index];
-            const uint8_t gray =
-                g_throttle_ui_motor_icon_gray[index]
-                    [(local_y * THROTTLE_UI_MOTOR_ICON_WIDTH) + local_x];
-            const uint16_t background =
-                ((view->motor_mask & (uint8_t)(1UL << index)) != 0U)
-                    ? THROTTLE_UI_COLOR_SELECTED
-                    : THROTTLE_UI_COLOR_UNSELECTED;
-            const uint16_t red =
-                (uint16_t)((((background >> 11U) & 0x1FU) * gray) / 255U);
-            const uint16_t green =
-                (uint16_t)((((background >> 5U) & 0x3FU) * gray) / 255U);
-            const uint16_t blue =
-                (uint16_t)(((background & 0x1FU) * gray) / 255U);
+    uint8_t motor_index;
+    uint16_t local_x;
+    uint16_t local_y;
+    uint8_t gray;
+    uint8_t selection_index;
 
-            *color = (uint16_t)((red << 11U) | (green << 5U) | blue);
-            return true;
-        }
+    if ((color == NULL) ||
+        !ThrottleUI_GetMotorIndexAtPixel(x, y, &motor_index))
+    {
+        return false;
     }
 
-    return false;
+    local_x = x - g_motor_icon_x[motor_index];
+    local_y = y - g_motor_icon_y[motor_index];
+    gray = g_throttle_ui_motor_icon_gray[motor_index]
+             [(local_y * THROTTLE_UI_MOTOR_ICON_WIDTH) + local_x];
+    selection_index =
+        ((view->motor_mask & (uint8_t)(1UL << motor_index)) != 0U) ? 1U : 0U;
+    *color = g_throttle_ui_motor_color_lut[selection_index][gray];
+    return true;
 }
 
 static bool ThrottleUI_LockPixel(uint16_t x,
@@ -628,35 +693,87 @@ static bool ThrottleUI_LockPixel(uint16_t x,
                                   g_throttle_ui_locked_icon);
 }
 
-static uint16_t ThrottleUI_GetLogicalPixel(uint16_t x,
-                                           uint16_t y,
-                                           const ThrottleUiView_t *view,
-                                           const char *limit_text,
-                                           const char *step_text,
-                                           const char *raw_text,
-                                           const char *mask_text)
+/**
+ * @brief 从MCU内部Flash中的4位调色板油门底图读取一个固定像素。
+ *
+ * 优化二“MCU内部Flash静态底图”：背景、LIM/STEP标签、±、THR、MASK
+ * 标签和进度条白框已预生成。每两个物理像素占1字节，页面固定内容只占
+ * 14,400字节Flash；运行时不访问外部FRAM，也不重复解析固定字体。
+ */
+static uint16_t ThrottleUI_GetStaticPhysicalPixel(uint32_t packed_row_index,
+                                                  uint16_t physical_x)
 {
-    uint16_t color = THROTTLE_UI_COLOR_BACKGROUND;
-    uint16_t motor_color;
-    const uint16_t fill_width =
-        (uint16_t)(((uint32_t)(THROTTLE_UI_BAR_RIGHT -
-                               THROTTLE_UI_BAR_LEFT - 1U) *
-                    view->throttle_percent) / 100U);
+    const uint32_t packed_index =
+        packed_row_index + ((uint32_t)physical_x >> 1U);
+    const uint8_t packed = g_throttle_ui_static_4bpp[packed_index];
+    const uint8_t palette_index = ((physical_x & 1U) == 0U)
+                                      ? (uint8_t)(packed >> 4U)
+                                      : (uint8_t)(packed & 0x0FU);
+
+    return g_throttle_ui_static_palette[palette_index];
+}
+
+/** @brief 在底图上合成顶部ALL、参数值、焦点和锁。 */
+static uint16_t ThrottleUI_OverlayTop(uint16_t x,
+                                      uint16_t y,
+                                      const ThrottleUiView_t *view,
+                                      const char *limit_text,
+                                      const char *step_text,
+                                      uint16_t static_color)
+{
+    uint16_t color = static_color;
 
     if (ThrottleUI_FocusPixel(x, y, view))
     {
-        if (view->edit_mode)
+        color = view->edit_mode
+                    ? THROTTLE_UI_COLOR_EDIT_FOCUS
+                    : ((view->focus >= THROTTLE_UI_FOCUS_MOTOR_1)
+                           ? THROTTLE_UI_COLOR_MOTOR_FOCUS
+                           : THROTTLE_UI_COLOR_TOP_FOCUS);
+
+        /* 固定LIM/STEP标签及±在原实现中覆盖焦点边框，保持原叠放顺序。 */
+        if (static_color != THROTTLE_UI_COLOR_BACKGROUND)
         {
-            color = THROTTLE_UI_COLOR_EDIT_FOCUS;
+            color = static_color;
         }
-        else if (view->focus >= THROTTLE_UI_FOCUS_MOTOR_1)
-        {
-            color = THROTTLE_UI_COLOR_MOTOR_FOCUS;
-        }
-        else
-        {
-            color = THROTTLE_UI_COLOR_TOP_FOCUS;
-        }
+    }
+
+    if ((x <= 38U) && ThrottleUI_LargeBoldTextPixel(x, y, 2U, 0U, "ALL"))
+    {
+        color = (view->motor_mask == 0xFFU)
+                    ? THROTTLE_UI_COLOR_ALL_ON
+                    : THROTTLE_UI_COLOR_ALL_OFF;
+    }
+    else if (((x >= 78U) && (x <= 109U) &&
+              ThrottleUI_MediumTextPixel(x, y, 78U, 4U, limit_text)) ||
+             ((x >= 163U) && (x <= 202U) &&
+              ThrottleUI_MediumTextPixel(x, y, 163U, 4U, step_text)))
+    {
+        color = THROTTLE_UI_COLOR_PARAMETER;
+    }
+
+    if ((x >= THROTTLE_UI_LOCK_X) &&
+        ThrottleUI_LockPixel(x, y, view->throttle_unlocked))
+    {
+        color = THROTTLE_UI_COLOR_FOREGROUND;
+    }
+
+    return color;
+}
+
+/** @brief 在底图上合成当前电机焦点及唯一命中的电机图标。 */
+static uint16_t ThrottleUI_OverlayMotor(uint16_t x,
+                                        uint16_t y,
+                                        const ThrottleUiView_t *view,
+                                        uint16_t color)
+{
+    uint16_t motor_color;
+
+    if (ThrottleUI_FocusPixel(x, y, view))
+    {
+        color = (view->focus >= THROTTLE_UI_FOCUS_MOTOR_1)
+                    ? THROTTLE_UI_COLOR_MOTOR_FOCUS
+                    : THROTTLE_UI_COLOR_TOP_FOCUS;
     }
 
     if (ThrottleUI_GetMotorIconPixel(x, y, view, &motor_color))
@@ -664,59 +781,94 @@ static uint16_t ThrottleUI_GetLogicalPixel(uint16_t x,
         color = motor_color;
     }
 
-    if (ThrottleUI_LargeBoldTextPixel(x, y, 2U, 0U, "ALL"))
-    {
-        color = (view->motor_mask == 0xFFU)
-                    ? THROTTLE_UI_COLOR_ALL_ON
-                    : THROTTLE_UI_COLOR_ALL_OFF;
-    }
-    else if (ThrottleUI_MediumTextPixel(x, y, 45U, 4U, "LIM:") ||
-             ThrottleUI_MediumTextPixel(x, y, 78U, 4U, limit_text) ||
-             ThrottleUI_MediumTextPixel(x, y, 115U, 4U, "STEP:") ||
-             ThrottleUI_MediumTextPixel(x, y, 163U, 4U, step_text))
-    {
-        color = THROTTLE_UI_COLOR_PARAMETER;
-    }
+    return color;
+}
 
-    /* 在STEP标签和值之间绘制一个紧凑的±符号。 */
-    if ((((x >= 156U) && (x <= 161U)) && (y == 10U)) ||
-        ((x == 158U) && (y >= 8U) && (y <= 12U)) ||
-        (((x >= 156U) && (x <= 161U)) && (y == 15U)))
-    {
-        color = THROTTLE_UI_COLOR_PARAMETER;
-    }
+/** @brief 在底图进度条白框内部合成当前油门百分比。 */
+static uint16_t ThrottleUI_OverlayBar(uint16_t x,
+                                      uint16_t y,
+                                      const ThrottleUiView_t *view,
+                                      uint16_t color)
+{
+    const uint16_t fill_width =
+        (uint16_t)(((uint32_t)(THROTTLE_UI_BAR_RIGHT -
+                               THROTTLE_UI_BAR_LEFT - 1U) *
+                    view->throttle_percent) / 100U);
 
-    if (ThrottleUI_LockPixel(x, y, view->throttle_unlocked))
-    {
-        color = THROTTLE_UI_COLOR_FOREGROUND;
-    }
-
-    if (ThrottleUI_LargeTextPixel(x, y, 7U, 96U, "THR:"))
-    {
-        color = THROTTLE_UI_COLOR_THROTTLE_TEXT;
-    }
-
-    if (ThrottleUI_PointOnRoundedBorder(
-            x, y,
-            THROTTLE_UI_BAR_LEFT,
-            THROTTLE_UI_BAR_TOP,
-            THROTTLE_UI_BAR_RIGHT,
-            THROTTLE_UI_BAR_BOTTOM,
-            3U, THROTTLE_UI_BAR_BORDER_WIDTH))
-    {
-        color = WHITE;
-    }
-
-    /* 已使用的油门区间采用连续实心填充，与原始UI画布保持一致。 */
     if ((fill_width > 0U) && (x > THROTTLE_UI_BAR_LEFT) &&
         (x <= (THROTTLE_UI_BAR_LEFT + fill_width)) &&
         (y > THROTTLE_UI_BAR_TOP) && (y < THROTTLE_UI_BAR_BOTTOM))
     {
-        color = THROTTLE_UI_COLOR_THROTTLE_FILL;
+        return THROTTLE_UI_COLOR_THROTTLE_FILL;
     }
 
-    if (ThrottleUI_MediumTextPixel(x, y, 128U, 101U, raw_text) ||
-        ThrottleUI_MediumTextPixel(x, y, 171U, 101U, "MASK:") ||
+    return color;
+}
+
+/**
+ * @brief 生成油门页面像素，并只运行刷新模式要求的动态绘制器。
+ *
+ * 优化一“区域判断优化”：完整刷新按顶部、两排电机、底部三个大区域
+ * 分派；优化三使局部刷新进一步直接进入BAR/RAW/MASK等专用路径。
+ */
+static uint16_t ThrottleUI_GetRenderedPixel(uint16_t x,
+                                            uint16_t y,
+                                            const ThrottleUiView_t *view,
+                                            const char *limit_text,
+                                            const char *step_text,
+                                            const char *raw_text,
+                                            const char *mask_text,
+                                            uint16_t static_color,
+                                            ThrottleUiRenderMode_t render_mode)
+{
+    uint16_t color = static_color;
+
+    if ((render_mode == THROTTLE_UI_RENDER_FULL) ||
+        (render_mode == THROTTLE_UI_RENDER_TOP))
+    {
+        if (y <= 26U)
+        {
+            color = ThrottleUI_OverlayTop(
+                x, y, view, limit_text, step_text, color);
+        }
+    }
+
+    if ((render_mode == THROTTLE_UI_RENDER_FULL) ||
+        (render_mode == THROTTLE_UI_RENDER_MOTOR))
+    {
+        if ((y >= 24U) && (y <= 95U))
+        {
+            color = ThrottleUI_OverlayMotor(x, y, view, color);
+        }
+    }
+
+    if ((render_mode == THROTTLE_UI_RENDER_LOCK) &&
+        ThrottleUI_LockPixel(x, y, view->throttle_unlocked))
+    {
+        color = THROTTLE_UI_COLOR_FOREGROUND;
+    }
+
+    if (((render_mode == THROTTLE_UI_RENDER_FULL) ||
+         (render_mode == THROTTLE_UI_RENDER_BAR)) &&
+        (y >= THROTTLE_UI_BAR_TOP) && (y <= THROTTLE_UI_BAR_BOTTOM))
+    {
+        color = ThrottleUI_OverlayBar(x, y, view, color);
+    }
+
+    if (((render_mode == THROTTLE_UI_RENDER_FULL) ||
+         (render_mode == THROTTLE_UI_RENDER_RAW_VALUE)) &&
+        (x >= THROTTLE_UI_RAW_VALUE_LEFT) &&
+        (x <= THROTTLE_UI_RAW_VALUE_RIGHT) &&
+        ThrottleUI_MediumTextPixel(
+            x, y, THROTTLE_UI_RAW_VALUE_LEFT, THROTTLE_UI_RAW_VALUE_TOP,
+            raw_text))
+    {
+        color = THROTTLE_UI_COLOR_FOREGROUND;
+    }
+
+    if (((render_mode == THROTTLE_UI_RENDER_FULL) ||
+         (render_mode == THROTTLE_UI_RENDER_MASK)) &&
+        (x >= 215U) &&
         ThrottleUI_MediumTextPixel(x, y, 215U, 101U, mask_text))
     {
         color = THROTTLE_UI_COLOR_FOREGROUND;
@@ -729,7 +881,8 @@ static void ThrottleUI_DrawLogicalRegion(const ThrottleUiView_t *view,
                                          uint16_t logical_left,
                                          uint16_t logical_top,
                                          uint16_t logical_right,
-                                         uint16_t logical_bottom)
+                                         uint16_t logical_bottom,
+                                         ThrottleUiRenderMode_t render_mode)
 {
     ThrottleUiView_t validated;
     char limit_text[5];
@@ -795,6 +948,8 @@ static void ThrottleUI_DrawLogicalRegion(const ThrottleUiView_t *view,
          ++physical_y)
     {
         uint16_t buffer_index = 0U;
+        const uint32_t packed_row_index =
+            (uint32_t)physical_y * UI_STATIC_ASSET_PACKED_ROW_BYTES;
 
         for (uint16_t physical_x = physical_left;
              physical_x <= physical_right;
@@ -803,14 +958,19 @@ static void ThrottleUI_DrawLogicalRegion(const ThrottleUiView_t *view,
             const uint16_t logical_x = physical_y;
             const uint16_t logical_y =
                 (THROTTLE_UI_LOGICAL_HEIGHT - 1U) - physical_x;
-            const uint16_t pixel = ThrottleUI_GetLogicalPixel(
+            const uint16_t static_color =
+                ThrottleUI_GetStaticPhysicalPixel(
+                    packed_row_index, physical_x);
+            const uint16_t pixel = ThrottleUI_GetRenderedPixel(
                 logical_x,
                 logical_y,
                 &validated,
                 limit_text,
                 step_text,
                 raw_text,
-                mask_text);
+                mask_text,
+                static_color,
+                render_mode);
 
             g_throttle_ui_line_buffer[buffer_index++] =
                 (uint8_t)(pixel >> 8U);
@@ -830,7 +990,17 @@ void ThrottleUI_Draw(const ThrottleUiView_t *view)
                                  0U,
                                  0U,
                                  THROTTLE_UI_LOGICAL_WIDTH - 1U,
-                                 THROTTLE_UI_LOGICAL_HEIGHT - 1U);
+                                 THROTTLE_UI_LOGICAL_HEIGHT - 1U,
+                                 THROTTLE_UI_RENDER_FULL);
+}
+
+/** @brief 根据焦点所在层选择顶部或电机专用绘制器。 */
+static ThrottleUiRenderMode_t ThrottleUI_GetFocusRenderMode(
+    ThrottleUiFocus_t focus)
+{
+    return (focus >= THROTTLE_UI_FOCUS_MOTOR_1)
+               ? THROTTLE_UI_RENDER_MOTOR
+               : THROTTLE_UI_RENDER_TOP;
 }
 
 void ThrottleUI_Update(const ThrottleUiView_t *previous_view,
@@ -860,7 +1030,12 @@ void ThrottleUI_Update(const ThrottleUiView_t *previous_view,
                 &left, &top, &right, &bottom))
         {
             ThrottleUI_DrawLogicalRegion(
-                &current, left, top, right, bottom);
+                &current,
+                left,
+                top,
+                right,
+                bottom,
+                ThrottleUI_GetFocusRenderMode(previous.focus));
         }
         if ((previous.focus != current.focus) &&
             ThrottleUI_GetFocusBounds(
@@ -868,7 +1043,12 @@ void ThrottleUI_Update(const ThrottleUiView_t *previous_view,
                 &left, &top, &right, &bottom))
         {
             ThrottleUI_DrawLogicalRegion(
-                &current, left, top, right, bottom);
+                &current,
+                left,
+                top,
+                right,
+                bottom,
+                ThrottleUI_GetFocusRenderMode(current.focus));
         }
     }
 
@@ -878,8 +1058,18 @@ void ThrottleUI_Update(const ThrottleUiView_t *previous_view,
             (uint8_t)(previous.motor_mask ^ current.motor_mask);
 
         /* ALL颜色和MASK文本始终跟随8位掩码。 */
-        ThrottleUI_DrawLogicalRegion(&current, 0U, 0U, 42U, 26U);
-        ThrottleUI_DrawLogicalRegion(&current, 168U, 98U, 234U, 118U);
+        ThrottleUI_DrawLogicalRegion(&current,
+                                     0U,
+                                     0U,
+                                     42U,
+                                     26U,
+                                     THROTTLE_UI_RENDER_TOP);
+        ThrottleUI_DrawLogicalRegion(&current,
+                                     168U,
+                                     98U,
+                                     234U,
+                                     118U,
+                                     THROTTLE_UI_RENDER_MASK);
 
         for (uint8_t index = 0U; index < 8U; ++index)
         {
@@ -891,12 +1081,13 @@ void ThrottleUI_Update(const ThrottleUiView_t *previous_view,
                         THROTTLE_UI_MOTOR_FOCUS_PADDING,
                     g_motor_icon_y[index] -
                         THROTTLE_UI_MOTOR_FOCUS_PADDING,
-                    g_motor_icon_x[index] +
-                        THROTTLE_UI_MOTOR_ICON_WIDTH +
-                        THROTTLE_UI_MOTOR_FOCUS_PADDING - 1U,
-                    g_motor_icon_y[index] +
-                        THROTTLE_UI_MOTOR_ICON_HEIGHT +
-                        THROTTLE_UI_MOTOR_FOCUS_BOTTOM_PADDING - 1U);
+                        g_motor_icon_x[index] +
+                            THROTTLE_UI_MOTOR_ICON_WIDTH +
+                            THROTTLE_UI_MOTOR_FOCUS_PADDING - 1U,
+                        g_motor_icon_y[index] +
+                            THROTTLE_UI_MOTOR_ICON_HEIGHT +
+                            THROTTLE_UI_MOTOR_FOCUS_BOTTOM_PADDING - 1U,
+                        THROTTLE_UI_RENDER_MOTOR);
             }
         }
     }
@@ -917,7 +1108,12 @@ void ThrottleUI_Update(const ThrottleUiView_t *previous_view,
         right = (previous_right > current_right)
                     ? previous_right
                     : current_right;
-        ThrottleUI_DrawLogicalRegion(&current, left, top, right, bottom);
+        ThrottleUI_DrawLogicalRegion(&current,
+                                     left,
+                                     top,
+                                     right,
+                                     bottom,
+                                     THROTTLE_UI_RENDER_TOP);
     }
 
     if (previous.step != current.step)
@@ -936,12 +1132,22 @@ void ThrottleUI_Update(const ThrottleUiView_t *previous_view,
         right = (previous_right > current_right)
                     ? previous_right
                     : current_right;
-        ThrottleUI_DrawLogicalRegion(&current, left, top, right, bottom);
+        ThrottleUI_DrawLogicalRegion(&current,
+                                     left,
+                                     top,
+                                     right,
+                                     bottom,
+                                     THROTTLE_UI_RENDER_TOP);
     }
 
     if (previous.throttle_unlocked != current.throttle_unlocked)
     {
-        ThrottleUI_DrawLogicalRegion(&current, 209U, 0U, 239U, 26U);
+        ThrottleUI_DrawLogicalRegion(&current,
+                                     209U,
+                                     0U,
+                                     239U,
+                                     26U,
+                                     THROTTLE_UI_RENDER_LOCK);
     }
 
 }
@@ -956,7 +1162,8 @@ void ThrottleUI_UpdateThrottleBar(const ThrottleUiView_t *view)
                                  THROTTLE_UI_BAR_LEFT,
                                  THROTTLE_UI_BAR_TOP,
                                  THROTTLE_UI_BAR_RIGHT,
-                                 THROTTLE_UI_BAR_BOTTOM);
+                                 THROTTLE_UI_BAR_BOTTOM,
+                                 THROTTLE_UI_RENDER_BAR);
 }
 
 void ThrottleUI_UpdateThrottleValue(const ThrottleUiView_t *view)
@@ -969,5 +1176,6 @@ void ThrottleUI_UpdateThrottleValue(const ThrottleUiView_t *view)
                                  THROTTLE_UI_RAW_VALUE_LEFT,
                                  THROTTLE_UI_RAW_VALUE_TOP,
                                  THROTTLE_UI_RAW_VALUE_RIGHT,
-                                 THROTTLE_UI_RAW_VALUE_BOTTOM);
+                                 THROTTLE_UI_RAW_VALUE_BOTTOM,
+                                 THROTTLE_UI_RENDER_RAW_VALUE);
 }
