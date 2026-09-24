@@ -60,6 +60,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/throttle_ui.c
     Core/Src/throttle_ui_asset.c
     Core/Src/brightness_ui.c
+    Core/Src/ui_static_asset.c
 
     # libcanard 传输层
     third_party/libcanard/canard.c

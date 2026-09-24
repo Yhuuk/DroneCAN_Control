@@ -2,6 +2,7 @@
 
 #include "lcd_init.h"
 #include "spi1_bus.h"
+#include "ui_static_asset.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -14,32 +15,11 @@
 #define MAIN_UI_FONT_BYTES_PER_ROW       2U
 
 /*
- * Node ID标签和数值分开定位，便于独立微调。
- * 原先整串从X=0绘制时，数值位于4个字符单元之后，即X=48；
- * 当前将数值左移4像素到X=44，"ID:"标签仍保持在X=0。
+ * "ID:"固定标签已固化在Flash底图；Node ID数值仍是动态元素，可独立定位。
+ * 当前数值X=38，保持优化前已经确认的页面布局不变。
  */
-#define MAIN_UI_NODE_LABEL_X             0U
-#define MAIN_UI_NODE_LABEL_Y             0U
 #define MAIN_UI_NODE_VALUE_X            38U
 #define MAIN_UI_NODE_VALUE_Y             0U
-
-/* 四个图标在“主页面_2.png”中的原始裁剪位置和尺寸。 */
-#define MAIN_UI_DIRECTION_ICON_X          9U
-#define MAIN_UI_DIRECTION_ICON_Y         40U
-#define MAIN_UI_DIRECTION_ICON_WIDTH     41U
-#define MAIN_UI_DIRECTION_ICON_HEIGHT    38U
-#define MAIN_UI_THROTTLE_ICON_X          70U
-#define MAIN_UI_THROTTLE_ICON_Y          45U
-#define MAIN_UI_THROTTLE_ICON_WIDTH      39U
-#define MAIN_UI_THROTTLE_ICON_HEIGHT     29U
-#define MAIN_UI_SETTINGS_ICON_X         131U
-#define MAIN_UI_SETTINGS_ICON_Y          40U
-#define MAIN_UI_SETTINGS_ICON_WIDTH      37U
-#define MAIN_UI_SETTINGS_ICON_HEIGHT     38U
-#define MAIN_UI_STATUS_ICON_X           190U
-#define MAIN_UI_STATUS_ICON_Y            47U
-#define MAIN_UI_STATUS_ICON_WIDTH        39U
-#define MAIN_UI_STATUS_ICON_HEIGHT       27U
 
 /* 锁图标以原图中心为基准放大约1.5倍，便于观察油门锁定状态。 */
 #define MAIN_UI_LOCK_ICON_X             186U
@@ -56,6 +36,26 @@
 #define MAIN_UI_COLOR_THROTTLE         0xFA8BU /* #06ea11 */ /*0xFA8BU*/
 #define MAIN_UI_COLOR_FOCUS            YELLOW
 
+/* 主页面底部油门条的固定几何参数。 */
+#define MAIN_UI_BAR_LEFT                61U
+#define MAIN_UI_BAR_TOP                105U
+#define MAIN_UI_BAR_RIGHT              123U
+#define MAIN_UI_BAR_BOTTOM             112U
+
+/**
+ * @brief 本次刷新需要合成的动态图层。
+ *
+ * 优化三“动态元素专用局部刷新”：焦点、锁和油门条各自只运行自己的
+ * 像素生成逻辑。局部更新不再进入完整页面的Node ID、CAN点等判断链。
+ */
+typedef enum
+{
+    MAIN_UI_RENDER_FULL = 0,
+    MAIN_UI_RENDER_FOCUS,
+    MAIN_UI_RENDER_LOCK,
+    MAIN_UI_RENDER_THROTTLE_BAR
+} MainUiRenderMode_t;
+
 /*
  * 12x24字高与23像素高的锁图标最接近。字库仍由lcd_draw.c唯一提供定义，
  * 本文件只声明并读取点阵，避免在多个源文件中重复定义字库数据。
@@ -67,155 +67,6 @@ extern const unsigned char ascii_2412[][48];
  * MainUI只由UiTask调用，因此无需为该缓冲区增加互斥锁。
  */
 static uint8_t g_main_ui_physical_row_buffer[LCD_W * 2U];
-
-/*
- * 以下四组1-bit点阵直接从用户提供的“主页面_2.png”图标区域提取。
- * 每行按从左到右、每字节低位优先保存；它们保留原图的轮廓、线宽和比例，
- * 避免使用几何公式重新近似时出现细线或齿轮变形。总计仅占698字节Flash。
- */
-static const uint8_t g_main_ui_direction_icon[228U] = {
-    0x00U, 0x80U, 0xFFU, 0x03U, 0x00U, 0x00U,
-    0x00U, 0xE0U, 0xFFU, 0x0FU, 0x00U, 0x00U,
-    0x00U, 0xFCU, 0xFFU, 0x3FU, 0x00U, 0x00U,
-    0x00U, 0x7EU, 0x00U, 0xFCU, 0x00U, 0x00U,
-    0x00U, 0x1FU, 0x00U, 0xF0U, 0x01U, 0x00U,
-    0x80U, 0x07U, 0x00U, 0xC0U, 0x03U, 0x00U,
-    0xC0U, 0x03U, 0x00U, 0x80U, 0x07U, 0x00U,
-    0xE0U, 0x01U, 0x00U, 0x00U, 0x0FU, 0x00U,
-    0xF0U, 0x00U, 0xFFU, 0x01U, 0x0EU, 0x00U,
-    0x70U, 0xC0U, 0xFFU, 0x07U, 0x1CU, 0x00U,
-    0x30U, 0xE0U, 0x01U, 0x0FU, 0x1CU, 0x00U,
-    0x00U, 0x78U, 0x38U, 0x1CU, 0x38U, 0x00U,
-    0x00U, 0x38U, 0x38U, 0x38U, 0x38U, 0x00U,
-    0x00U, 0x1CU, 0x38U, 0x70U, 0x70U, 0x00U,
-    0x00U, 0x6CU, 0x38U, 0x7CU, 0x70U, 0x00U,
-    0x0CU, 0xEEU, 0x00U, 0xEEU, 0x70U, 0x00U,
-    0x1EU, 0xE6U, 0x7DU, 0xEFU, 0xFCU, 0x01U,
-    0x1EU, 0x86U, 0xFFU, 0xC3U, 0xFCU, 0x01U,
-    0x3FU, 0x06U, 0xC6U, 0xC0U, 0xF8U, 0x01U,
-    0x3FU, 0x07U, 0xC6U, 0xC0U, 0xF0U, 0x00U,
-    0x3FU, 0x06U, 0xE6U, 0xC0U, 0xF0U, 0x00U,
-    0x0EU, 0xC6U, 0xFFU, 0xC3U, 0x60U, 0x00U,
-    0x0CU, 0xE6U, 0x7DU, 0xEFU, 0x00U, 0x00U,
-    0x1CU, 0xEEU, 0x00U, 0xEEU, 0x00U, 0x00U,
-    0x1CU, 0x0CU, 0x38U, 0x70U, 0x00U, 0x00U,
-    0x1CU, 0x1CU, 0x38U, 0x70U, 0x30U, 0x00U,
-    0x38U, 0x38U, 0x38U, 0x38U, 0x38U, 0x00U,
-    0x38U, 0xF0U, 0x38U, 0x1EU, 0x38U, 0x00U,
-    0x70U, 0xE0U, 0x83U, 0x0FU, 0x1CU, 0x00U,
-    0xF0U, 0xC0U, 0xFFU, 0x07U, 0x1EU, 0x00U,
-    0xE0U, 0x01U, 0xFFU, 0x01U, 0x0FU, 0x00U,
-    0xC0U, 0x03U, 0x00U, 0x80U, 0x07U, 0x00U,
-    0x80U, 0x07U, 0x00U, 0xC0U, 0x03U, 0x00U,
-    0x00U, 0x0FU, 0x00U, 0xF0U, 0x01U, 0x00U,
-    0x00U, 0x7EU, 0x00U, 0xFCU, 0x00U, 0x00U,
-    0x00U, 0xFCU, 0xFFU, 0x3FU, 0x00U, 0x00U,
-    0x00U, 0xF0U, 0xFFU, 0x0FU, 0x00U, 0x00U,
-    0x00U, 0x80U, 0xFFU, 0x01U, 0x00U, 0x00U
-};
-
-static const uint8_t g_main_ui_throttle_icon[145U] = {
-    0x00U, 0xC0U, 0xFFU, 0x01U, 0x00U,
-    0x00U, 0xF8U, 0xFFU, 0x0FU, 0x00U,
-    0x00U, 0xFEU, 0xFFU, 0x1FU, 0x00U,
-    0x00U, 0x3FU, 0x1CU, 0x7EU, 0x00U,
-    0x80U, 0x0FU, 0x1CU, 0xF8U, 0x00U,
-    0xE0U, 0x0BU, 0x1CU, 0xE8U, 0x03U,
-    0xF0U, 0x1DU, 0x1CU, 0xDCU, 0x03U,
-    0xF0U, 0x18U, 0x00U, 0x8CU, 0x07U,
-    0x78U, 0x38U, 0x00U, 0x0EU, 0x0FU,
-    0x3CU, 0x00U, 0x00U, 0x00U, 0x1EU,
-    0x7CU, 0x00U, 0x00U, 0x60U, 0x1CU,
-    0xEEU, 0x01U, 0x00U, 0x38U, 0x3BU,
-    0xEEU, 0x01U, 0x00U, 0xDCU, 0x3FU,
-    0x87U, 0x01U, 0x00U, 0x8EU, 0x73U,
-    0x07U, 0x00U, 0x80U, 0x87U, 0x71U,
-    0x07U, 0x00U, 0xC0U, 0x03U, 0x70U,
-    0x03U, 0x00U, 0xE0U, 0x01U, 0x70U,
-    0x03U, 0x00U, 0xFCU, 0x00U, 0x60U,
-    0x3FU, 0x00U, 0x7EU, 0x00U, 0x6FU,
-    0x3FU, 0x00U, 0x3EU, 0x00U, 0x6FU,
-    0x3FU, 0x00U, 0x3EU, 0x00U, 0x6EU,
-    0x03U, 0x00U, 0x3EU, 0x00U, 0x60U,
-    0x03U, 0x00U, 0x00U, 0x00U, 0x60U,
-    0x03U, 0x00U, 0x00U, 0x00U, 0x60U,
-    0x07U, 0x00U, 0x00U, 0x00U, 0x70U,
-    0x07U, 0x00U, 0x00U, 0x00U, 0x70U,
-    0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x7FU,
-    0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x7FU,
-    0xFEU, 0xFFU, 0xFFU, 0xFFU, 0x3FU
-};
-
-static const uint8_t g_main_ui_settings_icon[190U] = {
-    0x00U, 0xC0U, 0x7FU, 0x00U, 0x00U,
-    0x00U, 0xE0U, 0xFFU, 0x00U, 0x00U,
-    0x00U, 0xE0U, 0xFFU, 0x00U, 0x00U,
-    0x00U, 0xE0U, 0xE0U, 0x00U, 0x00U,
-    0x00U, 0xE0U, 0xE0U, 0x00U, 0x00U,
-    0x00U, 0xF0U, 0xE0U, 0x01U, 0x00U,
-    0xF8U, 0xFCU, 0xE0U, 0xE7U, 0x03U,
-    0xFCU, 0x7FU, 0xC0U, 0xFFU, 0x03U,
-    0xFCU, 0x1FU, 0x00U, 0xFFU, 0x07U,
-    0x9EU, 0x07U, 0x00U, 0x3CU, 0x0FU,
-    0x0EU, 0x00U, 0x00U, 0x00U, 0x0EU,
-    0x0FU, 0x00U, 0x1FU, 0x00U, 0x1EU,
-    0x07U, 0xC0U, 0x7FU, 0x00U, 0x1CU,
-    0x0FU, 0xE0U, 0xFFU, 0x00U, 0x1EU,
-    0x1FU, 0xF0U, 0xF1U, 0x01U, 0x1FU,
-    0x3EU, 0x78U, 0xC0U, 0xC3U, 0x0FU,
-    0x78U, 0x38U, 0x80U, 0xC3U, 0x03U,
-    0x38U, 0x3CU, 0x80U, 0xC3U, 0x01U,
-    0x38U, 0x1CU, 0x80U, 0x87U, 0x03U,
-    0x38U, 0x1CU, 0x00U, 0x87U, 0x03U,
-    0x38U, 0x1CU, 0x80U, 0x87U, 0x03U,
-    0x38U, 0x3CU, 0x80U, 0xC3U, 0x03U,
-    0x7CU, 0x38U, 0x80U, 0xC3U, 0x03U,
-    0x3EU, 0x78U, 0xC0U, 0x81U, 0x0FU,
-    0x1FU, 0xF0U, 0xFBU, 0x01U, 0x1FU,
-    0x07U, 0xE0U, 0xFFU, 0x00U, 0x1CU,
-    0x07U, 0xC0U, 0x3FU, 0x00U, 0x1CU,
-    0x0FU, 0x00U, 0x06U, 0x00U, 0x1EU,
-    0x0EU, 0x03U, 0x00U, 0x08U, 0x0EU,
-    0x9EU, 0x0FU, 0x00U, 0x3EU, 0x07U,
-    0xFCU, 0x1FU, 0x00U, 0xFFU, 0x07U,
-    0xF8U, 0x7FU, 0xC0U, 0xFFU, 0x03U,
-    0x78U, 0xF8U, 0xE0U, 0xE3U, 0x01U,
-    0x00U, 0xE0U, 0xE0U, 0x00U, 0x00U,
-    0x00U, 0xE0U, 0xE0U, 0x00U, 0x00U,
-    0x00U, 0xE0U, 0xE0U, 0x00U, 0x00U,
-    0x00U, 0xE0U, 0xFFU, 0x00U, 0x00U,
-    0x00U, 0xC0U, 0x7FU, 0x00U, 0x00U
-};
-
-static const uint8_t g_main_ui_status_icon[135U] = {
-    0xFEU, 0xFFU, 0xFFU, 0xFFU, 0x3FU,
-    0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x7FU,
-    0x07U, 0x00U, 0x00U, 0x00U, 0x70U,
-    0x03U, 0x00U, 0x00U, 0x00U, 0x70U,
-    0x03U, 0x00U, 0x00U, 0x00U, 0x60U,
-    0x03U, 0x18U, 0x00U, 0x00U, 0x60U,
-    0x03U, 0x3CU, 0x00U, 0x00U, 0x60U,
-    0x03U, 0x3CU, 0x00U, 0x00U, 0x66U,
-    0x03U, 0x3EU, 0x00U, 0x00U, 0x67U,
-    0x03U, 0x7EU, 0x08U, 0x00U, 0x67U,
-    0x03U, 0x77U, 0x1EU, 0xE0U, 0x67U,
-    0x03U, 0x77U, 0x1EU, 0xE0U, 0x67U,
-    0xFBU, 0x63U, 0xFFU, 0xE1U, 0x67U,
-    0xFBU, 0xE3U, 0xFFU, 0xEFU, 0x67U,
-    0xFBU, 0xE1U, 0xF3U, 0xFDU, 0x67U,
-    0x03U, 0xE0U, 0x03U, 0xFCU, 0x67U,
-    0x03U, 0xC0U, 0x01U, 0xFCU, 0x67U,
-    0x03U, 0xC0U, 0x00U, 0xECU, 0x66U,
-    0x07U, 0x00U, 0x00U, 0x00U, 0x70U,
-    0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x7FU,
-    0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x7FU,
-    0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x7FU,
-    0x03U, 0x80U, 0xFFU, 0xC0U, 0x66U,
-    0x03U, 0xC0U, 0xFFU, 0xE0U, 0x66U,
-    0x07U, 0x80U, 0xFFU, 0x40U, 0x72U,
-    0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x7FU,
-    0xFEU, 0xFFU, 0xFFU, 0xFFU, 0x3FU
-};
 
 /*
  * 锁体保持18x23不变。开锁点阵为了容纳向右伸出的锁梁，每行使用4字节
@@ -488,54 +339,6 @@ static bool MainUI_BitmapPixel(uint16_t x,
             (uint8_t)(1U << (local_x % 8U))) != 0U;
 }
 
-static bool MainUI_DirectionIconPixel(uint16_t x, uint16_t y)
-{
-    return MainUI_BitmapPixel(x,
-                              y,
-                              MAIN_UI_DIRECTION_ICON_X,
-                              MAIN_UI_DIRECTION_ICON_Y,
-                              MAIN_UI_DIRECTION_ICON_WIDTH,
-                              MAIN_UI_DIRECTION_ICON_HEIGHT,
-                              6U,
-                              g_main_ui_direction_icon);
-}
-
-static bool MainUI_ThrottleIconPixel(uint16_t x, uint16_t y)
-{
-    return MainUI_BitmapPixel(x,
-                              y,
-                              MAIN_UI_THROTTLE_ICON_X,
-                              MAIN_UI_THROTTLE_ICON_Y,
-                              MAIN_UI_THROTTLE_ICON_WIDTH,
-                              MAIN_UI_THROTTLE_ICON_HEIGHT,
-                              5U,
-                              g_main_ui_throttle_icon);
-}
-
-static bool MainUI_SettingsIconPixel(uint16_t x, uint16_t y)
-{
-    return MainUI_BitmapPixel(x,
-                              y,
-                              MAIN_UI_SETTINGS_ICON_X,
-                              MAIN_UI_SETTINGS_ICON_Y,
-                              MAIN_UI_SETTINGS_ICON_WIDTH,
-                              MAIN_UI_SETTINGS_ICON_HEIGHT,
-                              5U,
-                              g_main_ui_settings_icon);
-}
-
-static bool MainUI_StatusIconPixel(uint16_t x, uint16_t y)
-{
-    return MainUI_BitmapPixel(x,
-                              y,
-                              MAIN_UI_STATUS_ICON_X,
-                              MAIN_UI_STATUS_ICON_Y,
-                              MAIN_UI_STATUS_ICON_WIDTH,
-                              MAIN_UI_STATUS_ICON_HEIGHT,
-                              5U,
-                              g_main_ui_status_icon);
-}
-
 static bool MainUI_LockIconPixel(uint16_t x,
                                  uint16_t y,
                                  bool unlocked)
@@ -617,88 +420,118 @@ static bool MainUI_FocusPixel(uint16_t x,
         x, y, left, top, right, bottom, 6U);
 }
 
-/** @brief 生成主页面某个240x120逻辑坐标的RGB565颜色。 */
-static uint16_t MainUI_GetLogicalPixel(uint16_t x,
-                                       uint16_t y,
-                                       const MainUiView_t *view,
-                                       const char *node_value_text)
+/**
+ * @brief 从MCU内部Flash读取主页面静态底图像素。
+ *
+ * 优化二“MCU内部Flash静态底图”：固定标签、四个入口图标、THR文字和
+ * 进度条外框已经在编译前转换为4位调色板位图。资源按120x240物理扫描
+ * 顺序存放，每字节保存两个像素，因此完整底图只占14,400字节Flash，
+ * 不占RAM，也不访问与OLED共用SPI1的外部FRAM。
+ */
+static uint16_t MainUI_GetStaticPhysicalPixel(uint32_t packed_row_index,
+                                              uint16_t physical_x)
 {
-    uint16_t color = MAIN_UI_COLOR_BACKGROUND;
-    const uint16_t throttle_bar_left = 61U;
-    const uint16_t throttle_bar_top = 105U;
-    const uint16_t throttle_bar_right = 123U;
-    const uint16_t throttle_bar_bottom = 112U;
-    const uint16_t throttle_bar_inner_width =
-        throttle_bar_right - throttle_bar_left - 1U;
-    const uint16_t throttle_fill_width =
-        (uint16_t)(((uint32_t)throttle_bar_inner_width *
-                    view->throttle_percent) / 100U);
+    const uint32_t packed_index =
+        packed_row_index + ((uint32_t)physical_x >> 1U);
+    const uint8_t packed = g_main_ui_static_4bpp[packed_index];
+    const uint8_t palette_index = ((physical_x & 1U) == 0U)
+                                      ? (uint8_t)(packed >> 4U)
+                                      : (uint8_t)(packed & 0x0FU);
 
-    if (MainUI_FocusPixel(x, y, view->focus))
+    return g_main_ui_static_palette[palette_index];
+}
+
+/** @brief 在静态底图上仅合成当前油门条的动态填充部分。 */
+static uint16_t MainUI_OverlayThrottleBar(uint16_t x,
+                                          uint16_t y,
+                                          const MainUiView_t *view,
+                                          uint16_t color)
+{
+    const uint16_t inner_width =
+        MAIN_UI_BAR_RIGHT - MAIN_UI_BAR_LEFT - 1U;
+    const uint16_t fill_width =
+        (uint16_t)(((uint32_t)inner_width * view->throttle_percent) / 100U);
+
+    if ((fill_width > 0U) &&
+        (x > MAIN_UI_BAR_LEFT) &&
+        (x <= (MAIN_UI_BAR_LEFT + fill_width)) &&
+        (y > MAIN_UI_BAR_TOP) &&
+        (y < MAIN_UI_BAR_BOTTOM))
     {
-        color = MAIN_UI_COLOR_FOCUS;
+        return MAIN_UI_COLOR_THROTTLE;
     }
 
-    /*
-     * "ID:"与Node ID数值分别绘制，二者的坐标可通过顶部宏独立调整。
-     * 其他顶部文字仍从Y=0开始，与高度23像素的锁图标顶端对齐。
-     */
-    if (MainUI_TextPixel(x,
-                         y,
-                         MAIN_UI_NODE_LABEL_X,
-                         MAIN_UI_NODE_LABEL_Y,
-                         "ID:") ||
-        MainUI_TextPixel(x,
-                         y,
-                         MAIN_UI_NODE_VALUE_X,
-                         MAIN_UI_NODE_VALUE_Y,
-                         node_value_text) ||
-        MainUI_TextPixel(x, y, 98U, 0U, "CAN") ||
-        MainUI_DirectionIconPixel(x, y) ||
-        MainUI_ThrottleIconPixel(x, y) ||
-        MainUI_SettingsIconPixel(x, y) ||
-        MainUI_StatusIconPixel(x, y) ||
+    return color;
+}
+
+/**
+ * @brief 生成一个主页面像素，并按刷新模式只合成必要的动态元素。
+ *
+ * 优化一“区域判断优化”：完整刷新先按Y坐标分为顶部状态栏、中央入口区和
+ * 底部油门区；每个像素不会再检查四个图标、全部文字和全部状态。优化三
+ * 的局部模式则进一步只执行焦点、锁或油门条中的一个分支。
+ */
+static uint16_t MainUI_GetRenderedPixel(uint16_t x,
+                                        uint16_t y,
+                                        const MainUiView_t *view,
+                                        const char *node_value_text,
+                                        uint16_t static_color,
+                                        MainUiRenderMode_t render_mode)
+{
+    uint16_t color = static_color;
+
+    if ((render_mode == MAIN_UI_RENDER_FULL) ||
+        (render_mode == MAIN_UI_RENDER_FOCUS))
+    {
+        if ((y >= 35U) && (y <= 83U) &&
+            MainUI_FocusPixel(x, y, view->focus))
+        {
+            color = MAIN_UI_COLOR_FOCUS;
+
+            /* 原页面中固定图标位于焦点框之上，保持完全相同的叠放顺序。 */
+            if (static_color != MAIN_UI_COLOR_BACKGROUND)
+            {
+                color = static_color;
+            }
+        }
+    }
+
+    if ((render_mode == MAIN_UI_RENDER_FULL) && (y < 24U))
+    {
+        /* ID:和CAN已经在底图中；这里只绘制会变化的Node ID数值。 */
+        if ((x >= MAIN_UI_NODE_VALUE_X) &&
+            MainUI_TextPixel(x,
+                             y,
+                             MAIN_UI_NODE_VALUE_X,
+                             MAIN_UI_NODE_VALUE_Y,
+                             node_value_text))
+        {
+            color = MAIN_UI_COLOR_FOREGROUND;
+        }
+    }
+
+    if (((render_mode == MAIN_UI_RENDER_FULL) ||
+         (render_mode == MAIN_UI_RENDER_LOCK)) &&
+        (y < MAIN_UI_LOCK_ICON_HEIGHT) &&
         MainUI_LockIconPixel(x, y, view->throttle_unlocked))
     {
         color = MAIN_UI_COLOR_FOREGROUND;
     }
 
-    /*
-     * THR使用同一套12x24字体并贴齐屏幕底部。标签变宽后，进度条同步
-     * 右移20像素以避免重叠，其宽度及百分比计算方式保持不变。
-     */
-    if (MainUI_TextPixel(x, y, 7U, 96U, "THR:"))
-    {
-        color = MAIN_UI_COLOR_THROTTLE;
-    }
-
-    if (MainUI_PointOnRoundedRectangleBorder(
-            x,
-            y,
-            throttle_bar_left,
-            throttle_bar_top,
-            throttle_bar_right,
-            throttle_bar_bottom,
-            3U))
-    {
-        color = WHITE;
-    }
-
-    /* 已使用的油门区间采用连续实心填充；0%时只显示白色外框。 */
-    if ((throttle_fill_width > 0U) &&
-        (x > throttle_bar_left) &&
-        (x <= (throttle_bar_left + throttle_fill_width)) &&
-        (y > throttle_bar_top) &&
-        (y < throttle_bar_bottom))
-    {
-        color = MAIN_UI_COLOR_THROTTLE;
-    }
-
-    if (MainUI_PointInCircle(x, y, 148U, 12U, 6U))
+    if ((render_mode == MAIN_UI_RENDER_FULL) &&
+        (y <= 18U) &&
+        MainUI_PointInCircle(x, y, 148U, 12U, 6U))
     {
         color = view->can_online
                     ? MAIN_UI_COLOR_CAN_ONLINE
                     : MAIN_UI_COLOR_CAN_OFFLINE;
+    }
+
+    if (((render_mode == MAIN_UI_RENDER_FULL) ||
+         (render_mode == MAIN_UI_RENDER_THROTTLE_BAR)) &&
+        (y >= MAIN_UI_BAR_TOP) && (y <= MAIN_UI_BAR_BOTTOM))
+    {
+        color = MainUI_OverlayThrottleBar(x, y, view, color);
     }
 
     return color;
@@ -742,7 +575,8 @@ static void MainUI_DrawLogicalRegion(const MainUiView_t *view,
                                      uint16_t logical_left,
                                      uint16_t logical_top,
                                      uint16_t logical_right,
-                                     uint16_t logical_bottom)
+                                     uint16_t logical_bottom,
+                                     MainUiRenderMode_t render_mode)
 {
     MainUiView_t validated_view;
     char node_value_text[4];
@@ -801,6 +635,8 @@ static void MainUI_DrawLogicalRegion(const MainUiView_t *view,
          ++physical_y)
     {
         uint16_t buffer_index = 0U;
+        const uint32_t packed_row_index =
+            (uint32_t)physical_y * UI_STATIC_ASSET_PACKED_ROW_BYTES;
 
         for (uint16_t physical_x = physical_left;
              physical_x <= physical_right;
@@ -809,11 +645,15 @@ static void MainUI_DrawLogicalRegion(const MainUiView_t *view,
             const uint16_t logical_x = physical_y;
             const uint16_t logical_y =
                 (MAIN_UI_LOGICAL_HEIGHT - 1U) - physical_x;
-            const uint16_t color = MainUI_GetLogicalPixel(
+            const uint16_t static_color = MainUI_GetStaticPhysicalPixel(
+                packed_row_index, physical_x);
+            const uint16_t color = MainUI_GetRenderedPixel(
                 logical_x,
                 logical_y,
                 &validated_view,
-                node_value_text);
+                node_value_text,
+                static_color,
+                render_mode);
 
             g_main_ui_physical_row_buffer[buffer_index++] =
                 (uint8_t)(color >> 8);
@@ -832,7 +672,8 @@ void MainUI_Draw(const MainUiView_t *view)
                              0U,
                              0U,
                              MAIN_UI_LOGICAL_WIDTH - 1U,
-                             MAIN_UI_LOGICAL_HEIGHT - 1U);
+                             MAIN_UI_LOGICAL_HEIGHT - 1U,
+                             MAIN_UI_RENDER_FULL);
 }
 
 void MainUI_UpdateFocus(const MainUiView_t *previous_view,
@@ -865,7 +706,12 @@ void MainUI_UpdateFocus(const MainUiView_t *previous_view,
                               &right,
                               &bottom))
     {
-        MainUI_DrawLogicalRegion(&current, left, top, right, bottom);
+        MainUI_DrawLogicalRegion(&current,
+                                 left,
+                                 top,
+                                 right,
+                                 bottom,
+                                 MAIN_UI_RENDER_FOCUS);
     }
 
     /* 再只重画新焦点区域，不发送与焦点无关的顶部和底部画面。 */
@@ -875,7 +721,12 @@ void MainUI_UpdateFocus(const MainUiView_t *previous_view,
                               &right,
                               &bottom))
     {
-        MainUI_DrawLogicalRegion(&current, left, top, right, bottom);
+        MainUI_DrawLogicalRegion(&current,
+                                 left,
+                                 top,
+                                 right,
+                                 bottom,
+                                 MAIN_UI_RENDER_FOCUS);
     }
 }
 
@@ -905,12 +756,21 @@ void MainUI_UpdateThrottleStatus(const MainUiView_t *previous_view,
             MAIN_UI_LOCK_ICON_X,
             MAIN_UI_LOCK_ICON_Y,
             MAIN_UI_LOCK_ICON_X + MAIN_UI_UNLOCKED_ICON_WIDTH - 1U,
-            MAIN_UI_LOCK_ICON_Y + MAIN_UI_LOCK_ICON_HEIGHT - 1U);
+            MAIN_UI_LOCK_ICON_Y + MAIN_UI_LOCK_ICON_HEIGHT - 1U,
+            MAIN_UI_RENDER_LOCK);
     }
 
     if (previous.throttle_percent != current.throttle_percent)
     {
-        /* 只重画底部THR标签和进度条，不触碰四个入口及其焦点框。 */
-        MainUI_DrawLogicalRegion(&current, 0U, 95U, 125U, 119U);
+        /*
+         * THR标签和白色边框已在Flash底图中，只刷新会变化的条形内部。
+         * 窗口按4列对齐后扩出的像素也由同一底图正确恢复。
+         */
+        MainUI_DrawLogicalRegion(&current,
+                                 MAIN_UI_BAR_LEFT,
+                                 MAIN_UI_BAR_TOP,
+                                 MAIN_UI_BAR_RIGHT,
+                                 MAIN_UI_BAR_BOTTOM,
+                                 MAIN_UI_RENDER_THROTTLE_BAR);
     }
 }

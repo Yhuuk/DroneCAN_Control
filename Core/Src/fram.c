@@ -40,9 +40,9 @@ volatile uint32_t g_fram_error_count = 0U;
  * MB85RS256B 的device_id 为04 7F 05 09
  * 所以但我使用MB85RS256B这款的时候，就不能在初始化中以读取到的ID为是为初始化的标准之一
  */
-static const uint8_t g_fram_expected_device_id[FRAM_DEVICE_ID_LENGTH] = {
-    0x04U, 0x7FU, 0x01U, 0x01U
-};
+// static const uint8_t g_fram_expected_device_id[FRAM_DEVICE_ID_LENGTH] = {
+//     0x04U, 0x7FU, 0x01U, 0x01U
+// };
 
 static void FRAM_Select(void)
 {
