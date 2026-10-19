@@ -5,51 +5,39 @@
 /**
  * ADC1 的扫描 Rank 与 DMA 数组下标严格一一对应。
  * 如果以后在 CubeMX 中调整 ADC Rank，必须同步修改这里的下标定义。
+ * 
+ * 这个是 匿名枚举。优势是 可以把一组相关变量放在一起，调试器通常更容易识别枚举名称。
  */
 enum
 {
     /* PA0 / ADC1_IN5 / Rank 1：方向摇杆。 */
-    JOYSTICK_DMA_DIRECTION_INDEX = 0U,
+    JOYSTICK_DMA_DIRECTION_INDEX = JOYSTICK_DEFAULT_DIRECTION_ADC_INDEX,
 
     /* PA1 / ADC1_IN6 / Rank 2：油门摇杆。 */
-    JOYSTICK_DMA_THROTTLE_INDEX,
-    JOYSTICK_DMA_CHANNEL_COUNT
+    JOYSTICK_DMA_THROTTLE_INDEX = JOYSTICK_DEFAULT_THROTTLE_ADC_INDEX,
+    JOYSTICK_DMA_CHANNEL_COUNT = JOYSTICK_ADC_CHANNEL_COUNT
 };
 
 /** 校准后的每个轴统一输出到-1000~+1000。 */
 #define JOYSTICK_NORMALIZED_LIMIT 1000
 
 /**
- * @brief 单轴校准参数。
- *
- * min/max采用略微向机械行程内部收缩后的有效端点，使摇杆即使受温度、
- * 电源和机械误差影响，也能可靠到达-1000和+1000。
- */
-typedef struct
-{
-    uint16_t minimum;
-    uint16_t center;
-    uint16_t maximum;
-    uint16_t dead_zone;
-} JoystickAxisCalibration_t;
-
-/**
  * .minimum = 250U 这些都是给结构体成员赋初始值，叫做 指定成员初始化器
  */
 /* PA1油门轴：实测约240 / 1991 / 3660，中心死区取±40。 */
 static const JoystickAxisCalibration_t g_throttle_calibration = {
-    .minimum = 250U,
-    .center = 1991U,
-    .maximum = 3650U,
-    .dead_zone = 40U
+    .minimum = JOYSTICK_DEFAULT_THROTTLE_MINIMUM,
+    .center = JOYSTICK_DEFAULT_THROTTLE_CENTER,
+    .maximum = JOYSTICK_DEFAULT_THROTTLE_MAXIMUM,
+    .dead_zone = JOYSTICK_DEFAULT_THROTTLE_DEAD_ZONE
 };
 
 /* PA0方向轴：实测约343 / 2067 / 3670，中心死区取±30。 */
 static const JoystickAxisCalibration_t g_direction_calibration = {
-    .minimum = 350U,
-    .center = 2067U,
-    .maximum = 3660U,
-    .dead_zone = 30U
+    .minimum = JOYSTICK_DEFAULT_DIRECTION_MINIMUM,
+    .center = JOYSTICK_DEFAULT_DIRECTION_CENTER,
+    .maximum = JOYSTICK_DEFAULT_DIRECTION_MAXIMUM,
+    .dead_zone = JOYSTICK_DEFAULT_DIRECTION_DEAD_ZONE
 };
 
 /*

@@ -10,6 +10,62 @@ extern "C" {
 #include <stdbool.h>
 #include <stdint.h>
 
+/** ADC1一次扫描包含两个摇杆通道，DMA下标只能是0或1。 */
+#define JOYSTICK_ADC_CHANNEL_COUNT                 2U
+
+/** 当前PCB/CubeMX的默认映射：PA0/Rank 1为方向，PA1/Rank 2为油门。 */
+#define JOYSTICK_DEFAULT_DIRECTION_ADC_INDEX       0U
+#define JOYSTICK_DEFAULT_THROTTLE_ADC_INDEX        1U
+
+/** 尚未完成用户校准时使用的出厂参数，与现有实测值保持一致。 */
+#define JOYSTICK_DEFAULT_THROTTLE_MINIMUM          250U
+#define JOYSTICK_DEFAULT_THROTTLE_CENTER           1991U
+#define JOYSTICK_DEFAULT_THROTTLE_MAXIMUM          3650U
+#define JOYSTICK_DEFAULT_THROTTLE_DEAD_ZONE        40U
+#define JOYSTICK_DEFAULT_DIRECTION_MINIMUM         350U
+#define JOYSTICK_DEFAULT_DIRECTION_CENTER          2067U
+#define JOYSTICK_DEFAULT_DIRECTION_MAXIMUM         3660U
+#define JOYSTICK_DEFAULT_DIRECTION_DEAD_ZONE       30U
+
+/**
+ * @brief 单个摇杆轴的数值校准参数。
+ *
+ * minimum/maximum始终表示ADC数值大小关系，必须满足
+ * minimum < center < maximum。物理正方向是否对应ADC递增由独立的
+ * inverted标志描述，避免把“数值最小”与“物理负方向”混为一谈。
+ */
+typedef struct
+{
+    uint16_t minimum;
+    uint16_t center;
+    uint16_t maximum;
+    uint16_t dead_zone;
+} JoystickAxisCalibration_t;
+
+/**
+ * @brief 两个物理轴完整的持久化校准配置。
+ *
+ * ADC下标对应ADC扫描/DMA结果数组的位置，而不是MCU ADC通道号：
+ * 下标0是Rank 1，1是Rank 2。两个轴必须使用不同下标。
+ *
+ * calibration_valid只表示用户是否完成过完整校准；它与FRAM记录的CRC、
+ * 提交标记是否有效是两层不同概念。false时仍保存一套可工作的默认参数。
+ * 
+ * throttle_adc_index = 1，direction_adc_index = 0.这个是代表对应的ADC通道在DMA结果数组中的下标。
+ * 
+ * throttle_inverted = false，direction_inverted = false。这个是代表对应的ADC通道的物理方向是否与ADC数值递增方向一致。为了解决物理硬件连接是否方向
+ */
+typedef struct
+{
+    JoystickAxisCalibration_t throttle;
+    JoystickAxisCalibration_t direction;
+    uint8_t throttle_adc_index;
+    uint8_t direction_adc_index;
+    bool throttle_inverted;
+    bool direction_inverted;
+    bool calibration_valid;
+} JoystickCalibrationSettings_t;
+
 /**
  * @brief 摇杆两个模拟轴的一次一致性快照。
  *

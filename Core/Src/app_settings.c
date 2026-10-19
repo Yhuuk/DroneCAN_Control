@@ -14,13 +14,24 @@
  * 0x0080~0x07FF：保留给后续用户数据。
  */
 #define APP_SETTINGS_RECORD_MAGIC              0x31474643UL /* "CFG1" */
-#define APP_SETTINGS_FORMAT_VERSION            1U
-#define APP_SETTINGS_PAYLOAD_LENGTH            4U
+
+/*
+ * V1只包含LIM和STEP；V2在保持这两个字段偏移不变的基础上，追加两轴
+ * 校准、DMA通道映射、方向反转标志和用户校准有效标志。编码器只写V2，
+ * 解码器同时接受V1/V2，使旧FRAM记录升级固件后仍可保留LIM和STEP。
+ */
+#define APP_SETTINGS_FORMAT_VERSION_V1         1U
+#define APP_SETTINGS_FORMAT_VERSION_V2         2U
+#define APP_SETTINGS_CURRENT_FORMAT_VERSION    APP_SETTINGS_FORMAT_VERSION_V2
+#define APP_SETTINGS_V1_PAYLOAD_LENGTH          4U
+#define APP_SETTINGS_V2_PAYLOAD_LENGTH          24U
+#define APP_SETTINGS_CURRENT_PAYLOAD_LENGTH     APP_SETTINGS_V2_PAYLOAD_LENGTH
 #define APP_SETTINGS_COMMIT_MARKER              0xA55AC33CUL
 
 /**
- *以下是每个字段的偏移
- 记录空间的格式: 固定标识，格式版本，载荷长度，保存序号，用户数据空间(LIM,STEP)，CRC32校验，有效标记提交
+ * 以下是每个字段的偏移。
+ * 记录空间格式：固定标识、格式版本、载荷长度、保存序号、用户数据、
+ * CRC32校验、有效提交标记。V1用户数据只有LIM/STEP，V2追加摇杆校准。
  */
 #define APP_SETTINGS_MAGIC_OFFSET               0U
 #define APP_SETTINGS_VERSION_OFFSET             4U
@@ -29,6 +40,34 @@
 #define APP_SETTINGS_PAYLOAD_OFFSET             12U
 #define APP_SETTINGS_LIMIT_OFFSET               12U
 #define APP_SETTINGS_STEP_OFFSET                14U
+
+/* V2新增字段；所有uint16_t均按小端序逐字段编码。 */
+#define APP_SETTINGS_THROTTLE_MINIMUM_OFFSET    16U
+#define APP_SETTINGS_THROTTLE_CENTER_OFFSET     18U
+#define APP_SETTINGS_THROTTLE_MAXIMUM_OFFSET    20U
+#define APP_SETTINGS_THROTTLE_DEAD_ZONE_OFFSET  22U
+#define APP_SETTINGS_DIRECTION_MINIMUM_OFFSET   24U
+#define APP_SETTINGS_DIRECTION_CENTER_OFFSET    26U
+#define APP_SETTINGS_DIRECTION_MAXIMUM_OFFSET   28U
+#define APP_SETTINGS_DIRECTION_DEAD_ZONE_OFFSET 30U
+#define APP_SETTINGS_THROTTLE_ADC_INDEX_OFFSET  32U
+#define APP_SETTINGS_DIRECTION_ADC_INDEX_OFFSET 33U
+#define APP_SETTINGS_JOYSTICK_FLAGS_OFFSET      34U
+#define APP_SETTINGS_V2_RESERVED_OFFSET         35U
+
+/*
+ * 一个字节集中保存布尔状态，持久化格式不依赖C语言bool的具体大小。
+ * CALIBRATION_VALID表示用户已完整完成校准；两个INVERTED位表示物理正方向
+ * 与ADC数值递增方向相反，后续应用归一化结果时需要取反。
+ */
+#define APP_SETTINGS_FLAG_CALIBRATION_VALID     (1U << 0U)
+#define APP_SETTINGS_FLAG_THROTTLE_INVERTED     (1U << 1U)
+#define APP_SETTINGS_FLAG_DIRECTION_INVERTED    (1U << 2U)
+#define APP_SETTINGS_JOYSTICK_FLAGS_MASK        \
+    (APP_SETTINGS_FLAG_CALIBRATION_VALID |      \
+     APP_SETTINGS_FLAG_THROTTLE_INVERTED |      \
+     APP_SETTINGS_FLAG_DIRECTION_INVERTED)
+
 #define APP_SETTINGS_CRC_OFFSET                 56U
 #define APP_SETTINGS_COMMIT_OFFSET              60U
 
@@ -42,7 +81,12 @@
 _Static_assert((APP_SETTINGS_COMMIT_OFFSET + 4U) ==
                    APP_SETTINGS_RECORD_SIZE_BYTES,
                "commit marker must end the 64-byte record");
-_Static_assert((APP_SETTINGS_PAYLOAD_OFFSET + APP_SETTINGS_PAYLOAD_LENGTH) <=
+_Static_assert((APP_SETTINGS_V2_RESERVED_OFFSET + 1U) ==
+                   (APP_SETTINGS_PAYLOAD_OFFSET +
+                    APP_SETTINGS_V2_PAYLOAD_LENGTH),
+               "V2 payload offsets and length disagree");
+_Static_assert((APP_SETTINGS_PAYLOAD_OFFSET +
+                APP_SETTINGS_CURRENT_PAYLOAD_LENGTH) <=
                    APP_SETTINGS_CRC_OFFSET,
                "settings payload overlaps CRC field");
 _Static_assert((APP_SETTINGS_RECORD_B_ADDRESS +
@@ -52,6 +96,7 @@ _Static_assert((APP_SETTINGS_RECORD_B_ADDRESS +
 typedef struct
 {
     bool valid;
+    uint16_t format_version;
     uint32_t sequence;
     AppSettings_t settings;
 } AppSettingsDecodedRecord_t;
@@ -82,6 +127,34 @@ static void AppSettings_SetDefaults(AppSettings_t *settings)
 {
     settings->throttle_limit = THROTTLE_CONTROL_DEFAULT_LIMIT;
     settings->throttle_step = APP_SETTINGS_DEFAULT_STEP;
+
+    settings->joystick_calibration.throttle.minimum =
+        JOYSTICK_DEFAULT_THROTTLE_MINIMUM;
+    settings->joystick_calibration.throttle.center =
+        JOYSTICK_DEFAULT_THROTTLE_CENTER;
+    settings->joystick_calibration.throttle.maximum =
+        JOYSTICK_DEFAULT_THROTTLE_MAXIMUM;
+    settings->joystick_calibration.throttle.dead_zone =
+        JOYSTICK_DEFAULT_THROTTLE_DEAD_ZONE;
+
+    settings->joystick_calibration.direction.minimum =
+        JOYSTICK_DEFAULT_DIRECTION_MINIMUM;
+    settings->joystick_calibration.direction.center =
+        JOYSTICK_DEFAULT_DIRECTION_CENTER;
+    settings->joystick_calibration.direction.maximum =
+        JOYSTICK_DEFAULT_DIRECTION_MAXIMUM;
+    settings->joystick_calibration.direction.dead_zone =
+        JOYSTICK_DEFAULT_DIRECTION_DEAD_ZONE;
+
+    settings->joystick_calibration.throttle_adc_index =
+        JOYSTICK_DEFAULT_THROTTLE_ADC_INDEX;
+    settings->joystick_calibration.direction_adc_index =
+        JOYSTICK_DEFAULT_DIRECTION_ADC_INDEX;
+    settings->joystick_calibration.throttle_inverted = false;
+    settings->joystick_calibration.direction_inverted = false;
+
+    /* 默认值可以安全工作，但false明确表示它们不是用户校准所得。 */
+    settings->joystick_calibration.calibration_valid = false;
 }
 
 static bool AppSettings_IsStepValid(uint16_t step)
@@ -90,18 +163,79 @@ static bool AppSettings_IsStepValid(uint16_t step)
            (step == 100U) || (step == 1000U);
 }
 
+/** @brief 检查单轴参数能否安全用于分段归一化，防止除数为0或下溢。 */
+static bool AppSettings_IsAxisCalibrationValid(
+    const JoystickAxisCalibration_t *calibration)
+{
+    if ((calibration == NULL) ||
+        (calibration->minimum >= calibration->center) ||
+        (calibration->center >= calibration->maximum) ||
+        (calibration->maximum > 4095U))
+    {
+        return false;
+    }
+
+    return (calibration->dead_zone <
+            (uint16_t)(calibration->center - calibration->minimum)) &&
+           (calibration->dead_zone <
+            (uint16_t)(calibration->maximum - calibration->center));
+}
+
+/** @brief 检查两个物理轴是否映射到两个不同且存在的DMA结果下标。 */
+static bool AppSettings_IsJoystickMappingValid(
+    const JoystickCalibrationSettings_t *calibration)
+{
+    return (calibration != NULL) &&
+           (calibration->throttle_adc_index < JOYSTICK_ADC_CHANNEL_COUNT) &&
+           (calibration->direction_adc_index < JOYSTICK_ADC_CHANNEL_COUNT) &&
+           (calibration->throttle_adc_index !=
+            calibration->direction_adc_index);
+}
+
 static bool AppSettings_AreValuesValid(const AppSettings_t *settings)
 {
     return (settings != NULL) &&
            (settings->throttle_limit <= THROTTLE_CONTROL_RAW_COMMAND_MAX) &&
-           AppSettings_IsStepValid(settings->throttle_step);
+           AppSettings_IsStepValid(settings->throttle_step) &&
+           AppSettings_IsAxisCalibrationValid(
+               &settings->joystick_calibration.throttle) &&
+           AppSettings_IsAxisCalibrationValid(
+               &settings->joystick_calibration.direction) &&
+           AppSettings_IsJoystickMappingValid(
+               &settings->joystick_calibration);
+}
+
+static bool AppSettings_AreAxisCalibrationsEqual(
+    const JoystickAxisCalibration_t *left,
+    const JoystickAxisCalibration_t *right)
+{
+    return (left->minimum == right->minimum) &&
+           (left->center == right->center) &&
+           (left->maximum == right->maximum) &&
+           (left->dead_zone == right->dead_zone);
 }
 
 static bool AppSettings_AreEqual(const AppSettings_t *left,
                                  const AppSettings_t *right)
 {
     return (left->throttle_limit == right->throttle_limit) &&
-           (left->throttle_step == right->throttle_step);
+           (left->throttle_step == right->throttle_step) &&
+           AppSettings_AreAxisCalibrationsEqual(
+               &left->joystick_calibration.throttle,
+               &right->joystick_calibration.throttle) &&
+           AppSettings_AreAxisCalibrationsEqual(
+               &left->joystick_calibration.direction,
+               &right->joystick_calibration.direction) &&
+           (left->joystick_calibration.throttle_adc_index ==
+            right->joystick_calibration.throttle_adc_index) &&
+           (left->joystick_calibration.direction_adc_index ==
+            right->joystick_calibration.direction_adc_index) &&
+           (left->joystick_calibration.throttle_inverted ==
+            right->joystick_calibration.throttle_inverted) &&
+           (left->joystick_calibration.direction_inverted ==
+            right->joystick_calibration.direction_inverted) &&
+           (left->joystick_calibration.calibration_valid ==
+            right->joystick_calibration.calibration_valid);
 }
 
 static void AppSettings_PutU16(uint8_t *destination, uint16_t value)
@@ -182,26 +316,87 @@ static bool AppSettings_SequenceIsNewer(uint32_t candidate,
     return (int32_t)(candidate - reference) > 0;
 }
 
+/**
+ * 它负责把RAM中的 AppSettings_t 转换成固定64字节FRAM记录。
+ * 
+ * 现在执行过程是：
+1. 64字节缓冲区全部清零。
+2. 写入固定标识。
+3. 写入版本V2。
+4. 写入载荷长度24。
+5. 写入保存序号。
+6. 写入LIM。
+7. 写入STEP。
+8. 写入油门轴四个校准值。
+9. 写入方向轴四个校准值。
+10. 写入两个ADC下标。
+11. 把三个布尔值组合为一个标志字节。
+12. 预留字节写0。
+13. 对偏移0～35计算CRC32。
+14. CRC写到偏移56～59。
+15. 提交标记暂时保持0。
+ */
 static void AppSettings_EncodeRecord(uint8_t *record,
                                      const AppSettings_t *settings,
                                      uint32_t sequence)
 {
     const uint16_t crc_length =
-        APP_SETTINGS_PAYLOAD_OFFSET + APP_SETTINGS_PAYLOAD_LENGTH;
+        APP_SETTINGS_PAYLOAD_OFFSET + APP_SETTINGS_CURRENT_PAYLOAD_LENGTH;
+    uint8_t joystick_flags = 0U;
     uint32_t crc;
 
     memset(record, 0, APP_SETTINGS_RECORD_SIZE_BYTES);
     AppSettings_PutU32(&record[APP_SETTINGS_MAGIC_OFFSET],
                        APP_SETTINGS_RECORD_MAGIC);
     AppSettings_PutU16(&record[APP_SETTINGS_VERSION_OFFSET],
-                       APP_SETTINGS_FORMAT_VERSION);
+                       APP_SETTINGS_CURRENT_FORMAT_VERSION);
     AppSettings_PutU16(&record[APP_SETTINGS_PAYLOAD_LENGTH_OFFSET],
-                       APP_SETTINGS_PAYLOAD_LENGTH);
+                       APP_SETTINGS_CURRENT_PAYLOAD_LENGTH);
     AppSettings_PutU32(&record[APP_SETTINGS_SEQUENCE_OFFSET], sequence);
     AppSettings_PutU16(&record[APP_SETTINGS_LIMIT_OFFSET],
                        settings->throttle_limit);
     AppSettings_PutU16(&record[APP_SETTINGS_STEP_OFFSET],
                        settings->throttle_step);
+
+    AppSettings_PutU16(&record[APP_SETTINGS_THROTTLE_MINIMUM_OFFSET],
+                       settings->joystick_calibration.throttle.minimum);
+    AppSettings_PutU16(&record[APP_SETTINGS_THROTTLE_CENTER_OFFSET],
+                       settings->joystick_calibration.throttle.center);
+    AppSettings_PutU16(&record[APP_SETTINGS_THROTTLE_MAXIMUM_OFFSET],
+                       settings->joystick_calibration.throttle.maximum);
+    AppSettings_PutU16(&record[APP_SETTINGS_THROTTLE_DEAD_ZONE_OFFSET],
+                       settings->joystick_calibration.throttle.dead_zone);
+
+    AppSettings_PutU16(&record[APP_SETTINGS_DIRECTION_MINIMUM_OFFSET],
+                       settings->joystick_calibration.direction.minimum);
+    AppSettings_PutU16(&record[APP_SETTINGS_DIRECTION_CENTER_OFFSET],
+                       settings->joystick_calibration.direction.center);
+    AppSettings_PutU16(&record[APP_SETTINGS_DIRECTION_MAXIMUM_OFFSET],
+                       settings->joystick_calibration.direction.maximum);
+    AppSettings_PutU16(&record[APP_SETTINGS_DIRECTION_DEAD_ZONE_OFFSET],
+                       settings->joystick_calibration.direction.dead_zone);
+
+    record[APP_SETTINGS_THROTTLE_ADC_INDEX_OFFSET] =
+        settings->joystick_calibration.throttle_adc_index;
+    record[APP_SETTINGS_DIRECTION_ADC_INDEX_OFFSET] =
+        settings->joystick_calibration.direction_adc_index;
+
+    if (settings->joystick_calibration.calibration_valid)
+    {
+        joystick_flags |= APP_SETTINGS_FLAG_CALIBRATION_VALID;
+    }
+    if (settings->joystick_calibration.throttle_inverted)
+    {
+        joystick_flags |= APP_SETTINGS_FLAG_THROTTLE_INVERTED;
+    }
+    if (settings->joystick_calibration.direction_inverted)
+    {
+        joystick_flags |= APP_SETTINGS_FLAG_DIRECTION_INVERTED;
+    }
+    record[APP_SETTINGS_JOYSTICK_FLAGS_OFFSET] = joystick_flags;
+
+    /* 预留字节固定写0，后续格式扩展仍通过新的format_version解释。 */
+    record[APP_SETTINGS_V2_RESERVED_OFFSET] = 0U;
 
     crc = AppSettings_Crc32(record, crc_length);
     AppSettings_PutU32(&record[APP_SETTINGS_CRC_OFFSET], crc);
@@ -214,21 +409,39 @@ static bool AppSettings_DecodeRecord(
     const uint8_t *record,
     AppSettingsDecodedRecord_t *decoded)
 {
+    const uint16_t format_version =
+        AppSettings_GetU16(&record[APP_SETTINGS_VERSION_OFFSET]);
     const uint16_t payload_length =
         AppSettings_GetU16(&record[APP_SETTINGS_PAYLOAD_LENGTH_OFFSET]);
+    uint8_t joystick_flags;
     uint16_t crc_length;
     uint32_t stored_crc;
     uint32_t calculated_crc;
 
     decoded->valid = false;
+    decoded->format_version = 0U;
+
+    /*
+     * 先放入完整V2默认值。读取V1时只覆盖共同存在的LIM/STEP，因此旧记录
+     * 能保留用户参数，同时新增校准字段明确回退为“默认值、尚未校准”。
+     */
+    AppSettings_SetDefaults(&decoded->settings);
 
     if ((AppSettings_GetU32(&record[APP_SETTINGS_COMMIT_OFFSET]) !=
          APP_SETTINGS_COMMIT_MARKER) ||
         (AppSettings_GetU32(&record[APP_SETTINGS_MAGIC_OFFSET]) !=
-         APP_SETTINGS_RECORD_MAGIC) ||
-        (AppSettings_GetU16(&record[APP_SETTINGS_VERSION_OFFSET]) !=
-         APP_SETTINGS_FORMAT_VERSION) ||
-        (payload_length != APP_SETTINGS_PAYLOAD_LENGTH))
+          APP_SETTINGS_RECORD_MAGIC))
+    {
+        return false;
+    }
+
+    /* 每个已知版本必须与自己的固定载荷长度成对出现。 */
+    if (((format_version == APP_SETTINGS_FORMAT_VERSION_V1) &&
+         (payload_length != APP_SETTINGS_V1_PAYLOAD_LENGTH)) ||
+        ((format_version == APP_SETTINGS_FORMAT_VERSION_V2) &&
+         (payload_length != APP_SETTINGS_V2_PAYLOAD_LENGTH)) ||
+        ((format_version != APP_SETTINGS_FORMAT_VERSION_V1) &&
+         (format_version != APP_SETTINGS_FORMAT_VERSION_V2)))
     {
         return false;
     }
@@ -249,12 +462,62 @@ static bool AppSettings_DecodeRecord(
     decoded->settings.throttle_step =
         AppSettings_GetU16(&record[APP_SETTINGS_STEP_OFFSET]);
 
+    if (format_version == APP_SETTINGS_FORMAT_VERSION_V2)
+    {
+        joystick_flags = record[APP_SETTINGS_JOYSTICK_FLAGS_OFFSET];
+
+        /* 未定义的标志位不允许静默通过，防止误读未来格式或损坏数据。 */
+        if ((joystick_flags &
+             (uint8_t)~APP_SETTINGS_JOYSTICK_FLAGS_MASK) != 0U)
+        {
+            return false;
+        }
+
+        decoded->settings.joystick_calibration.throttle.minimum =
+            AppSettings_GetU16(
+                &record[APP_SETTINGS_THROTTLE_MINIMUM_OFFSET]);
+        decoded->settings.joystick_calibration.throttle.center =
+            AppSettings_GetU16(
+                &record[APP_SETTINGS_THROTTLE_CENTER_OFFSET]);
+        decoded->settings.joystick_calibration.throttle.maximum =
+            AppSettings_GetU16(
+                &record[APP_SETTINGS_THROTTLE_MAXIMUM_OFFSET]);
+        decoded->settings.joystick_calibration.throttle.dead_zone =
+            AppSettings_GetU16(
+                &record[APP_SETTINGS_THROTTLE_DEAD_ZONE_OFFSET]);
+
+        decoded->settings.joystick_calibration.direction.minimum =
+            AppSettings_GetU16(
+                &record[APP_SETTINGS_DIRECTION_MINIMUM_OFFSET]);
+        decoded->settings.joystick_calibration.direction.center =
+            AppSettings_GetU16(
+                &record[APP_SETTINGS_DIRECTION_CENTER_OFFSET]);
+        decoded->settings.joystick_calibration.direction.maximum =
+            AppSettings_GetU16(
+                &record[APP_SETTINGS_DIRECTION_MAXIMUM_OFFSET]);
+        decoded->settings.joystick_calibration.direction.dead_zone =
+            AppSettings_GetU16(
+                &record[APP_SETTINGS_DIRECTION_DEAD_ZONE_OFFSET]);
+
+        decoded->settings.joystick_calibration.throttle_adc_index =
+            record[APP_SETTINGS_THROTTLE_ADC_INDEX_OFFSET];
+        decoded->settings.joystick_calibration.direction_adc_index =
+            record[APP_SETTINGS_DIRECTION_ADC_INDEX_OFFSET];
+        decoded->settings.joystick_calibration.calibration_valid =
+            (joystick_flags & APP_SETTINGS_FLAG_CALIBRATION_VALID) != 0U;
+        decoded->settings.joystick_calibration.throttle_inverted =
+            (joystick_flags & APP_SETTINGS_FLAG_THROTTLE_INVERTED) != 0U;
+        decoded->settings.joystick_calibration.direction_inverted =
+            (joystick_flags & APP_SETTINGS_FLAG_DIRECTION_INVERTED) != 0U;
+    }
+
     if (!AppSettings_AreValuesValid(&decoded->settings))
     {
         return false;
     }
 
     decoded->valid = true;
+    decoded->format_version = format_version;
     return true;
 }
 

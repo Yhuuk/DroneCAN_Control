@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 #include "main.h"
+#include "joystick.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -15,11 +16,17 @@ extern "C" {
 #define APP_SETTINGS_RECORD_A_ADDRESS  0x0000U
 #define APP_SETTINGS_RECORD_B_ADDRESS  0x0040U
 
-/** 油门参数的掉电保存内容；后续用户配置统一扩展该结构和记录版本。 */
+/**
+ * @brief V2掉电配置的RAM表示。
+ *
+ * FRAM中不直接写入该C结构体，而是由app_settings.c按照固定字节偏移逐字段
+ * 编码，从而避免bool大小、结构体填充和编译器差异改变持久化格式。
+ */
 typedef struct
 {
     uint16_t throttle_limit;
     uint16_t throttle_step;
+    JoystickCalibrationSettings_t joystick_calibration;
 } AppSettings_t;
 
 /**
