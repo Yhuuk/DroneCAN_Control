@@ -36,6 +36,7 @@
 #include "lcd_init.h"
 #include "main_ui.h"
 #include "motor_direction_ui.h"
+#include "settings_ui.h"
 #include "throttle_control.h"
 #include "throttle_ui.h"
 #include "ui_input_event.h"
@@ -110,6 +111,7 @@ typedef enum
   UI_PAGE_MAIN = 0,
   UI_PAGE_MOTOR_DIRECTION,
   UI_PAGE_THROTTLE,
+  UI_PAGE_SETTINGS,
   /** 主页面第4个“状态”入口暂时承载OLED亮度测试页面。 */
   UI_PAGE_BRIGHTNESS
 } UiPage_t;
@@ -355,6 +357,8 @@ static bool UiTask_UpdateThrottleView(ThrottleUiView_t *view);
 static bool UiTask_UpdateMainThrottleView(MainUiView_t *view);
 static bool UiTask_HandleMainInput(MainUiView_t *view,
                                    const UiInputEvent_t *event);
+static bool UiTask_HandleSettingsInput(SettingsUiView_t *view,
+                                       const UiInputEvent_t *event);
 static bool UiTask_HandleBrightnessInput(BrightnessUiView_t *view,
                                          const UiInputEvent_t *event);
 static void UiTask_PrepareDirectionPageEntry(MotorDirectionUiView_t *view);
@@ -632,6 +636,12 @@ void StartUiTask(void *argument)
       .focus = MAIN_UI_FOCUS_DIRECTION
   };
   UiPage_t current_page = UI_PAGE_MAIN;
+  SettingsUiView_t settings_view = {
+      .focus = SETTINGS_UI_FOCUS_SYSTEM,
+      .first_visible_item = 0U
+  };
+  /* 亮度页既保留原“状态”入口，也可由设置列表进入。 */
+  UiPage_t brightness_return_page = UI_PAGE_MAIN;
   ThrottleUiView_t throttle_view = {
       .throttle_unlocked = false,
       .edit_mode = false,
@@ -949,7 +959,20 @@ void StartUiTask(void *argument)
                 break;
 
               case MAIN_UI_FOCUS_SETTINGS:
-                /* 设置页面尚未设计，Confirm暂时保持在主页面。 */
+                /* 每次从主页面进入时，从参考图第一行System开始选择。 */
+                settings_view.focus = SETTINGS_UI_FOCUS_SYSTEM;
+                settings_view.first_visible_item = 0U;
+                current_page = UI_PAGE_SETTINGS;
+
+                refresh_start_tick = osKernelGetTickCount();
+                SettingsUI_Draw(&settings_view);
+                refresh_duration =
+                    osKernelGetTickCount() - refresh_start_tick;
+                g_ui_last_refresh_time_ms = refresh_duration;
+                if (refresh_duration > g_ui_max_refresh_time_ms)
+                {
+                  g_ui_max_refresh_time_ms = refresh_duration;
+                }
                 break;
 
               case MAIN_UI_FOCUS_STATUS:
@@ -957,6 +980,7 @@ void StartUiTask(void *argument)
                  * 第4个状态入口临时作为亮度测试入口。亮度值在UiTask整个
                  * 生命周期内保留，离开再进入不会自动恢复到最大值。
                  */
+                brightness_return_page = UI_PAGE_MAIN;
                 current_page = UI_PAGE_BRIGHTNESS;
                 refresh_start_tick = osKernelGetTickCount();
                 BrightnessUI_Draw(&brightness_view);
@@ -1115,17 +1139,16 @@ void StartUiTask(void *argument)
             }
           }
         }
-        else if (current_page == UI_PAGE_BRIGHTNESS)
+        else if (current_page == UI_PAGE_SETTINGS)
         {
-          const BrightnessUiView_t previous_brightness_view =
-              brightness_view;
+          const SettingsUiView_t previous_settings_view = settings_view;
 
           if ((input->key_id == KEY_ID_BACK) &&
               ((input->action == UI_INPUT_ACTION_SHORT_PRESS) ||
                (input->action == UI_INPUT_ACTION_LONG_PRESS)))
           {
-            /* 简单测试页没有子层级，短按或长按BACK都直接返回主页面。 */
-            main_view.focus = MAIN_UI_FOCUS_STATUS;
+            /* 设置页没有编辑子层级，短按或长按BACK都返回设置入口。 */
+            main_view.focus = MAIN_UI_FOCUS_SETTINGS;
             current_page = UI_PAGE_MAIN;
             (void)UiTask_UpdateMainThrottleView(&main_view);
 
@@ -1140,6 +1163,72 @@ void StartUiTask(void *argument)
             next_main_refresh_tick =
                 osKernelGetTickCount() +
                 pdMS_TO_TICKS(MAIN_UI_REFRESH_PERIOD_MS);
+          }
+          else if ((input->action == UI_INPUT_ACTION_SHORT_PRESS) &&
+                   (input->key_id == KEY_ID_CONFIRM) &&
+                   (settings_view.focus == SETTINGS_UI_FOCUS_BRIGHTNESS))
+          {
+            /*
+             * 只接入工程中已经存在的亮度业务。System、摇杆校准、
+             * Node ID和声音尚无完整业务，本次Confirm不虚构处理逻辑。
+             */
+            brightness_return_page = UI_PAGE_SETTINGS;
+            current_page = UI_PAGE_BRIGHTNESS;
+
+            refresh_start_tick = osKernelGetTickCount();
+            BrightnessUI_Draw(&brightness_view);
+            refresh_duration = osKernelGetTickCount() - refresh_start_tick;
+            g_ui_last_refresh_time_ms = refresh_duration;
+            if (refresh_duration > g_ui_max_refresh_time_ms)
+            {
+              g_ui_max_refresh_time_ms = refresh_duration;
+            }
+          }
+          else if (UiTask_HandleSettingsInput(&settings_view, input))
+          {
+            refresh_start_tick = osKernelGetTickCount();
+            SettingsUI_UpdateFocus(&previous_settings_view, &settings_view);
+            refresh_duration = osKernelGetTickCount() - refresh_start_tick;
+            g_ui_last_refresh_time_ms = refresh_duration;
+            if (refresh_duration > g_ui_max_refresh_time_ms)
+            {
+              g_ui_max_refresh_time_ms = refresh_duration;
+            }
+          }
+        }
+        else if (current_page == UI_PAGE_BRIGHTNESS)
+        {
+          const BrightnessUiView_t previous_brightness_view =
+              brightness_view;
+
+          if ((input->key_id == KEY_ID_BACK) &&
+              ((input->action == UI_INPUT_ACTION_SHORT_PRESS) ||
+               (input->action == UI_INPUT_ACTION_LONG_PRESS)))
+          {
+            refresh_start_tick = osKernelGetTickCount();
+            if (brightness_return_page == UI_PAGE_SETTINGS)
+            {
+              /* 从设置列表进入亮度页时，BACK回到原来的“亮度”焦点。 */
+              current_page = UI_PAGE_SETTINGS;
+              SettingsUI_Draw(&settings_view);
+            }
+            else
+            {
+              /* 保留原“状态”入口的返回行为，不改变现有测试通路。 */
+              main_view.focus = MAIN_UI_FOCUS_STATUS;
+              current_page = UI_PAGE_MAIN;
+              (void)UiTask_UpdateMainThrottleView(&main_view);
+              MainUI_Draw(&main_view);
+              next_main_refresh_tick =
+                  osKernelGetTickCount() +
+                  pdMS_TO_TICKS(MAIN_UI_REFRESH_PERIOD_MS);
+            }
+            refresh_duration = osKernelGetTickCount() - refresh_start_tick;
+            g_ui_last_refresh_time_ms = refresh_duration;
+            if (refresh_duration > g_ui_max_refresh_time_ms)
+            {
+              g_ui_max_refresh_time_ms = refresh_duration;
+            }
           }
           else if (UiTask_HandleBrightnessInput(&brightness_view, input))
           {
@@ -1843,6 +1932,79 @@ static bool UiTask_HandleMainInput(MainUiView_t *view,
         break;
     }
 
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * @brief 处理设置列表五个选项之间的焦点循环。
+ *
+ * 本函数只维护设置页的显示焦点，不执行任何设置业务。Confirm由UiTask的
+ * 页面路由单独处理，因此尚未实现的选项不会因为新增UI而获得虚构功能。
+ *
+ * @param[in,out] view 设置页面显示状态。
+ * @param[in] event InputTask已经完成消抖和短/长按判定的输入事件。
+ * @return true表示焦点发生变化，需要局部刷新；false表示无需刷新。
+ */
+static bool UiTask_HandleSettingsInput(SettingsUiView_t *view,
+                                       const UiInputEvent_t *event)
+{
+  uint8_t focus_index;
+
+  if ((view == NULL) || (event == NULL) ||
+      (event->action != UI_INPUT_ACTION_SHORT_PRESS))
+  {
+    return false;
+  }
+
+  if (event->key_id == KEY_ID_UP)
+  {
+    if (view->focus == SETTINGS_UI_FOCUS_SYSTEM)
+    {
+      /* 首项继续向上时循环到末项，并显示最后三个条目。 */
+      view->focus = SETTINGS_UI_FOCUS_SOUND;
+      view->first_visible_item =
+          (uint8_t)(SETTINGS_UI_FOCUS_COUNT -
+                    SETTINGS_UI_VISIBLE_ITEM_COUNT);
+      return true;
+    }
+
+    view->focus = (SettingsUiFocus_t)((uint32_t)view->focus - 1U);
+    focus_index = (uint8_t)view->focus;
+
+    /*
+     * 焦点仍在当前三行内时只移动焦点，不滚动窗口；只有越过最上行
+     * 才把窗口向上移动一项。这正是“亮度→Node ID仍保持原三项”的逻辑。
+     */
+    if (focus_index < view->first_visible_item)
+    {
+      view->first_visible_item = focus_index;
+    }
+    return true;
+  }
+
+  if (event->key_id == KEY_ID_DOWN)
+  {
+    if (view->focus == SETTINGS_UI_FOCUS_SOUND)
+    {
+      /* 末项继续向下时循环回首项，并恢复最前面的三个条目。 */
+      view->focus = SETTINGS_UI_FOCUS_SYSTEM;
+      view->first_visible_item = 0U;
+      return true;
+    }
+
+    view->focus = (SettingsUiFocus_t)((uint32_t)view->focus + 1U);
+    focus_index = (uint8_t)view->focus;
+    if (focus_index >=
+        (uint8_t)(view->first_visible_item +
+                  SETTINGS_UI_VISIBLE_ITEM_COUNT))
+    {
+      view->first_visible_item =
+          (uint8_t)(focus_index -
+                    (SETTINGS_UI_VISIBLE_ITEM_COUNT - 1U));
+    }
     return true;
   }
 
