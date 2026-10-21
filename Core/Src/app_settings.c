@@ -771,6 +771,35 @@ HAL_StatusTypeDef AppSettings_SaveNow(const AppSettings_t *settings,
     return AppSettings_AttemptSave(now_tick);
 }
 
+HAL_StatusTypeDef AppSettings_SaveConfirmed(
+    const AppSettings_t *settings)
+{
+    HAL_StatusTypeDef status;
+
+    if (!AppSettings_AreValuesValid(settings))
+    {
+        ++g_app_settings_save_error_count;
+        return HAL_ERROR;
+    }
+
+    /*
+     * 不先修改g_current_settings，也不建立pending：这样写入或回读校验失败
+     * 时，原活动A/B记录、原RAM配置及原有待保存请求都保持原样。
+     */
+    status = AppSettings_WriteNewRecord(settings);
+    if (status == HAL_OK)
+    {
+        /* WriteNewRecord已同步current/saved；新记录覆盖任何旧的待保存请求。 */
+        g_save_pending = false;
+    }
+    else
+    {
+        ++g_app_settings_save_error_count;
+    }
+
+    return status;
+}
+
 HAL_StatusTypeDef AppSettings_ProcessDeferredSave(uint32_t now_tick)
 {
     if (!g_save_pending ||

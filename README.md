@@ -111,3 +111,56 @@ BP1 BP0 = 11：全部受保护
 | 读取数据READ | `0x03` |
 | 写入数据WRITE | `0x02` |
 | 读取设备ID RDID | `0x9F` |
+
+## 摇杆校准
+
+### 极限值是否收缩
+1. 极限值没有向中心收缩，而是采取100组稳定后的ADC原始数据取平均，并且进行了四舍五入的算法
+2. 没有固定收缩 20、40、100 ADC。或者没有按 95%、98% 等比例收缩。
+3. 实测现在的校准符合实际，校准之后，摇杆推到极限，其油门数值也能拉满
+4. 归一化算法位于 [joystick.c (line 122)](E:/cubemx_keli5/cubemx_keil5_Projects/DrondCAN_Control/Core/Src/joystick.c:122)。
+
+### 摇杆校准的采集的数据保存在哪里
+1. 本轮校准的临时数据全部是 `StartUiTask()` 的局部 RAM 变量：`JoystickExtremeCalibration_t extreme_calibrations[JOYSTICK_CALIBRATION_SLOT_COUNT]`
+2. 五步校准完成后，在`SAVE` 保存数据写入 `FRAM` 之前会进行整体检查。代码在[freertos.c (line 2379)]
+
+### `FRAM` 存储、`RAM` 参数及立即生效机制
+1. 完整调用链路
+```text
+用户短按 Confirm，焦点位于 SAVE
+  ↓
+确认 saved == false
+  ↓
+UiTask_AreCalibrationCandidatesValid()
+  ↓
+将结果页六个值复制到 candidate_settings
+  ↓
+AppSettings_SaveConfirmed()
+  ↓
+AppSettings_WriteNewRecord()
+  ↓
+写入非活动FRAM槽
+  ↓
+写提交标记
+  ↓
+FRAM回读 + CRC + 字段一致性验证
+  ↓
+返回 HAL_OK
+  ↓
+Joystick_ApplyCalibrationSettings()
+  ↓
+candidate_settings.joystick_calibration
+复制到 g_joystick_calibration
+  ↓
+下一次 Joystick_Process() 使用新参数
+```
+所以明确的顺序是 
+```text
+先确认 FRAM 成功
+再更新运行 RAM
+最后把 SAVE 显示为绿色
+```
+
+### `RAM` 热更新机制
+1. `热更新` 指的是 `MCU` 不复位、不重新初始化`ADC`、不重新启动`DMA`，在程序运行过程中，把新校准的配置复制到摇杆算法实际使用的`RAM`变量中
+2. 热更新函数和目标是 `Joystick_ApplyCalibrationSettings()` 和 `static JoystickCalibrationSettings_t g_joystick_calibration;`

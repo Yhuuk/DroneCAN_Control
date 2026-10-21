@@ -170,10 +170,25 @@ int main(void)
   (void)FRAM_Init();
 
   /*
-   * 从FRAM的A/B记录加载LIM和STEP。读取失败时模块内部保留安全默认值，
-   * 不阻止LCD和CAN启动；首次使用会自动建立一条默认配置记录。
+   * 从FRAM的A/B记录加载LIM、STEP和摇杆校准。读取失败时模块内部保留
+   * 安全默认值，不阻止LCD和CAN启动；首次使用会建立默认配置记录。
    */
   (void)AppSettings_Init();
+
+  /*
+   * ADC/DMA虽已启动，但调度器尚未运行，不存在InputTask并发读取。此处把
+   * FRAM恢复值（或安全默认值）装入joystick运行RAM，保证重启后校准生效。
+   */
+  {
+    AppSettings_t startup_settings;
+
+    AppSettings_Get(&startup_settings);
+    if (!Joystick_ApplyCalibrationSettings(
+            &startup_settings.joystick_calibration))
+    {
+      Error_Handler();
+    }
+  }
 
   LCD_Init();
 

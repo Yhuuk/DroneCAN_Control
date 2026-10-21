@@ -54,6 +54,15 @@ void AppSettings_RequestDeferredSave(const AppSettings_t *settings,
 HAL_StatusTypeDef AppSettings_SaveNow(const AppSettings_t *settings,
                                       uint32_t now_tick);
 
+/**
+ * @brief 用户明确确认时执行一次事务式立即保存。
+ *
+ * 与SaveNow的自动重试语义不同：失败时不会把候选值放入待保存队列，也不会
+ * 改写当前/已保存配置；调用页面可原地保留候选数据，等待用户再次按SAVE。
+ */
+HAL_StatusTypeDef AppSettings_SaveConfirmed(
+    const AppSettings_t *settings);
+
 /** @brief 到达延迟截止时间时执行一次保存；未到期时不访问FRAM。 */
 HAL_StatusTypeDef AppSettings_ProcessDeferredSave(uint32_t now_tick);
 

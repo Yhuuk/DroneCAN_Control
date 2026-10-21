@@ -21,23 +21,28 @@ enum
 /** 校准后的每个轴统一输出到-1000~+1000。 */
 #define JOYSTICK_NORMALIZED_LIMIT 1000
 
-/**
- * .minimum = 250U 这些都是给结构体成员赋初始值，叫做 指定成员初始化器
+/*
+ * 上电先使用安全默认值；main()从FRAM加载AppSettings后会调用Apply接口替换。
+ * 运行期只有UiTask在FRAM确认成功后写入，InputTask每轮先取得一致性快照。
  */
-/* PA1油门轴：实测约240 / 1991 / 3660，中心死区取±40。 */
-static const JoystickAxisCalibration_t g_throttle_calibration = {
-    .minimum = JOYSTICK_DEFAULT_THROTTLE_MINIMUM,
-    .center = JOYSTICK_DEFAULT_THROTTLE_CENTER,
-    .maximum = JOYSTICK_DEFAULT_THROTTLE_MAXIMUM,
-    .dead_zone = JOYSTICK_DEFAULT_THROTTLE_DEAD_ZONE
-};
-
-/* PA0方向轴：实测约343 / 2067 / 3670，中心死区取±30。 */
-static const JoystickAxisCalibration_t g_direction_calibration = {
-    .minimum = JOYSTICK_DEFAULT_DIRECTION_MINIMUM,
-    .center = JOYSTICK_DEFAULT_DIRECTION_CENTER,
-    .maximum = JOYSTICK_DEFAULT_DIRECTION_MAXIMUM,
-    .dead_zone = JOYSTICK_DEFAULT_DIRECTION_DEAD_ZONE
+static JoystickCalibrationSettings_t g_joystick_calibration = {
+    .throttle = {
+        .minimum = JOYSTICK_DEFAULT_THROTTLE_MINIMUM,
+        .center = JOYSTICK_DEFAULT_THROTTLE_CENTER,
+        .maximum = JOYSTICK_DEFAULT_THROTTLE_MAXIMUM,
+        .dead_zone = JOYSTICK_DEFAULT_THROTTLE_DEAD_ZONE
+    },
+    .direction = {
+        .minimum = JOYSTICK_DEFAULT_DIRECTION_MINIMUM,
+        .center = JOYSTICK_DEFAULT_DIRECTION_CENTER,
+        .maximum = JOYSTICK_DEFAULT_DIRECTION_MAXIMUM,
+        .dead_zone = JOYSTICK_DEFAULT_DIRECTION_DEAD_ZONE
+    },
+    .throttle_adc_index = JOYSTICK_DEFAULT_THROTTLE_ADC_INDEX,
+    .direction_adc_index = JOYSTICK_DEFAULT_DIRECTION_ADC_INDEX,
+    .throttle_inverted = false,
+    .direction_inverted = false,
+    .calibration_valid = false
 };
 
 /*
@@ -62,6 +67,50 @@ static volatile bool g_joystick_started;
 
 volatile uint32_t g_joystick_snapshot_count;
 volatile uint32_t g_joystick_dma_error_count;
+
+static bool Joystick_IsAxisCalibrationValid(
+    const JoystickAxisCalibration_t *calibration)
+{
+    if ((calibration == NULL) ||
+        (calibration->minimum >= calibration->center) ||
+        (calibration->center >= calibration->maximum) ||
+        (calibration->maximum > 4095U))
+    {
+        return false;
+    }
+
+    return (calibration->dead_zone <
+            (uint16_t)(calibration->center - calibration->minimum)) &&
+           (calibration->dead_zone <
+            (uint16_t)(calibration->maximum - calibration->center));
+}
+
+static bool Joystick_IsCalibrationSettingsValid(
+    const JoystickCalibrationSettings_t *settings)
+{
+    return (settings != NULL) &&
+           Joystick_IsAxisCalibrationValid(&settings->throttle) &&
+           Joystick_IsAxisCalibrationValid(&settings->direction) &&
+           (settings->throttle_adc_index < JOYSTICK_ADC_CHANNEL_COUNT) &&
+           (settings->direction_adc_index < JOYSTICK_ADC_CHANNEL_COUNT) &&
+           (settings->throttle_adc_index != settings->direction_adc_index);
+}
+
+/** @brief 在不错误开启原本已关闭中断的前提下复制运行参数。 */
+static uint32_t Joystick_EnterCritical(void)
+{
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    return primask;
+}
+
+static void Joystick_ExitCritical(uint32_t primask)
+{
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
+}
 
 /**
  * @brief 使用中心两侧不同的实际行程，把一个ADC原始值分段映射为±1000。
@@ -176,6 +225,8 @@ HAL_StatusTypeDef Joystick_Init(void)
 
 void Joystick_Process(void)
 {
+    JoystickCalibrationSettings_t calibration;
+    uint32_t primask;
     uint16_t throttle;
     uint16_t direction;
     int16_t normalized_throttle;
@@ -192,13 +243,27 @@ void Joystick_Process(void)
      * 
      * normalized_direction 和 normalized_throttle先转换成无符号16位整数uint16_t
      */
-    throttle = g_joystick_dma_values[JOYSTICK_DMA_THROTTLE_INDEX];
-    direction = g_joystick_dma_values[JOYSTICK_DMA_DIRECTION_INDEX];
+    /* 与UiTask的热更新互斥，只在复制小结构体的极短时间内关闭中断。 */
+    primask = Joystick_EnterCritical();
+    calibration = g_joystick_calibration;
+    Joystick_ExitCritical(primask);
+
+    throttle = g_joystick_dma_values[calibration.throttle_adc_index];
+    direction = g_joystick_dma_values[calibration.direction_adc_index];
 
     normalized_throttle =
-        Joystick_NormalizeAxis(throttle, &g_throttle_calibration);
+        Joystick_NormalizeAxis(throttle, &calibration.throttle);
     normalized_direction =
-        Joystick_NormalizeAxis(direction, &g_direction_calibration);
+        Joystick_NormalizeAxis(direction, &calibration.direction);
+
+    if (calibration.throttle_inverted)
+    {
+        normalized_throttle = (int16_t)-normalized_throttle;
+    }
+    if (calibration.direction_inverted)
+    {
+        normalized_direction = (int16_t)-normalized_direction;
+    }
 
     g_joystick_published_raw_values = ((uint32_t)direction << 16U) |
                                       (uint32_t)throttle;
@@ -240,6 +305,37 @@ bool Joystick_GetLatestNormalized(JoystickNormalizedValues_t *values)
     values->direction_normalized =
         (int16_t)(uint16_t)(packed_values >> 16U);
     return true;
+}
+
+bool Joystick_ApplyCalibrationSettings(
+    const JoystickCalibrationSettings_t *settings)
+{
+    uint32_t primask;
+
+    if (!Joystick_IsCalibrationSettingsValid(settings))
+    {
+        return false;
+    }
+
+    primask = Joystick_EnterCritical();
+    g_joystick_calibration = *settings;
+    Joystick_ExitCritical(primask);
+    return true;
+}
+
+void Joystick_GetCalibrationSettings(
+    JoystickCalibrationSettings_t *settings)
+{
+    uint32_t primask;
+
+    if (settings == NULL)
+    {
+        return;
+    }
+
+    primask = Joystick_EnterCritical();
+    *settings = g_joystick_calibration;
+    Joystick_ExitCritical(primask);
 }
 
 /**

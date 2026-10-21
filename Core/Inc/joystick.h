@@ -136,6 +136,22 @@ bool Joystick_GetLatestRaw(JoystickRawValues_t *values);
  */
 bool Joystick_GetLatestNormalized(JoystickNormalizedValues_t *values);
 
+/**
+ * @brief 校验并立即替换应用程序正在使用的摇杆校准参数。
+ *
+ * 复制过程在很短的临界区内完成，避免InputTask恰好读取到一半旧值、一半
+ * 新值。该函数只更新RAM，不负责写FRAM；调用方必须先确认持久化成功。
+ *
+ * @retval true  参数完整合法，已立即生效。
+ * @retval false 参数为空、轴范围/死区非法或两个DMA下标冲突，未作修改。
+ */
+bool Joystick_ApplyCalibrationSettings(
+    const JoystickCalibrationSettings_t *settings);
+
+/** @brief 取得当前实际参与归一化运算的RAM校准参数快照。 */
+void Joystick_GetCalibrationSettings(
+    JoystickCalibrationSettings_t *settings);
+
 /* 调试统计量，可在调试器 Watch 窗口中直接观察。 */
 extern volatile uint32_t g_joystick_snapshot_count;
 extern volatile uint32_t g_joystick_dma_error_count;

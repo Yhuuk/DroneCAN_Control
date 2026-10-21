@@ -51,6 +51,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/dronecan_node.c
     Core/Src/key_input.c
     Core/Src/joystick.c
+    Core/Src/joystick_calibration.c
+    Core/Src/joystick_calibration_ui.c
+    Core/Src/joystick_calibration_ui_asset.c
+    Core/Src/joystick_calibration_result_ui.c
     Core/Src/spi1_bus.c
     Core/Src/fram.c
     Core/Src/app_settings.c

@@ -32,6 +32,9 @@
 #include "dronecan_config.h"
 #include "dronecan_node.h"
 #include "joystick.h"
+#include "joystick_calibration.h"
+#include "joystick_calibration_result_ui.h"
+#include "joystick_calibration_ui.h"
 #include "key_input.h"
 #include "lcd_init.h"
 #include "main_ui.h"
@@ -112,6 +115,8 @@ typedef enum
   UI_PAGE_MOTOR_DIRECTION,
   UI_PAGE_THROTTLE,
   UI_PAGE_SETTINGS,
+  UI_PAGE_JOYSTICK_CALIBRATION,
+  UI_PAGE_JOYSTICK_CALIBRATION_RESULT,
   /** 主页面第4个“状态”入口暂时承载OLED亮度测试页面。 */
   UI_PAGE_BRIGHTNESS
 } UiPage_t;
@@ -159,6 +164,12 @@ typedef enum
 
 /** 精确油门数字以20 Hz刷新，避免数字跳动过快且降低无效绘制量。 */
 #define THROTTLE_UI_VALUE_REFRESH_PERIOD_MS 50U
+
+/** 中心校准按InputTask发布周期每10 ms尝试接收一份新ADC快照。 */
+#define JOYSTICK_CALIBRATION_SAMPLE_PERIOD_MS 10U
+
+/** 原始X/Y数值以20 Hz局部刷新；采样统计本身仍保持100 Hz。 */
+#define JOYSTICK_CALIBRATION_DISPLAY_PERIOD_MS 50U
 
 /** 亮度测试页每次短按UP/DOWN改变约6.3%，并在0和255处饱和。 */
 #define BRIGHTNESS_UI_ADJUST_STEP 16U
@@ -401,6 +412,25 @@ static bool UiTask_HandleDirectionQueryEvent(
     MotorDirectionUiView_t *view,
     UiDirectionQueryControl_t *control,
     const DirectionQueryEvent_t *event);
+static bool UiTask_GetExtremeStepConfig(
+    JoystickCalibrationUiStep_t step,
+    JoystickCalibrationExtremeSlot_t *slot,
+    JoystickCalibrationAxis_t *axis,
+    JoystickCalibrationExtremeDirection_t *direction);
+static bool UiTask_AreCalibrationCandidatesValid(
+    const JoystickCenterCalibration_t *center,
+    const JoystickExtremeCalibration_t
+        extremes[JOYSTICK_CALIBRATION_SLOT_COUNT]);
+static void UiTask_PrepareCalibrationResultView(
+    JoystickCalibrationResultUiView_t *view,
+    const JoystickCenterCalibration_t *center,
+    const JoystickExtremeCalibration_t
+        extremes[JOYSTICK_CALIBRATION_SLOT_COUNT],
+    const AppSettings_t *settings);
+static void UiTask_ResetCalibrationSession(
+    JoystickCenterCalibration_t *center,
+    JoystickExtremeCalibration_t
+        extremes[JOYSTICK_CALIBRATION_SLOT_COUNT]);
 static void DirectionQueryAnimationTimerCallback(void *argument);
 static void DirectionAutoQueryTimerCallback(void *argument);
 static void CanTask_HandleCommand(const CanCommand_t *command,
@@ -655,6 +685,36 @@ void StartUiTask(void *argument)
   BrightnessUiView_t brightness_view = {
       .brightness = 0xFFU
   };
+  JoystickCalibrationUiView_t calibration_view = {
+      .raw_x = 0U,
+      .raw_y = 0U,
+      .step = JOYSTICK_CALIBRATION_UI_STEP_CENTER,
+      .focus = JOYSTICK_CALIBRATION_UI_FOCUS_OK,
+      .state = JOYSTICK_CALIBRATION_UI_READY
+  };
+  JoystickCalibrationResultUiView_t calibration_result_view = {
+      .x_axis = {
+          .minimum = JOYSTICK_DEFAULT_DIRECTION_MINIMUM,
+          .center = JOYSTICK_DEFAULT_DIRECTION_CENTER,
+          .maximum = JOYSTICK_DEFAULT_DIRECTION_MAXIMUM,
+          .dead_zone = JOYSTICK_DEFAULT_DIRECTION_DEAD_ZONE
+      },
+      .y_axis = {
+          .minimum = JOYSTICK_DEFAULT_THROTTLE_MINIMUM,
+          .center = JOYSTICK_DEFAULT_THROTTLE_CENTER,
+          .maximum = JOYSTICK_DEFAULT_THROTTLE_MAXIMUM,
+          .dead_zone = JOYSTICK_DEFAULT_THROTTLE_DEAD_ZONE
+      },
+      .focus = JOYSTICK_CALIBRATION_RESULT_FOCUS_SAVE,
+      .saved = false
+  };
+  /*
+   * 中心值和四个方向极限均只保存在UiTask本轮校准会话的RAM中。
+   * 本次不调用AppSettings，也不会改写joystick.c正在使用的正式参数。
+   */
+  JoystickCenterCalibration_t center_calibration;
+  JoystickExtremeCalibration_t
+      extreme_calibrations[JOYSTICK_CALIBRATION_SLOT_COUNT];
   MotorDirectionUiView_t view = {
       .power_state = MOTOR_DIRECTION_UI_POWER_OFF,
       .focus = MOTOR_DIRECTION_UI_FOCUS_SWITCH,
@@ -690,6 +750,8 @@ void StartUiTask(void *argument)
   uint32_t next_main_refresh_tick;
   uint32_t next_throttle_bar_refresh_tick;
   uint32_t next_throttle_value_refresh_tick;
+  uint32_t next_calibration_sample_tick;
+  uint32_t next_calibration_display_tick;
   uint32_t queue_wait_ticks;
   uint8_t displayed_throttle_percent = throttle_view.throttle_percent;
   uint16_t displayed_raw_command = throttle_view.raw_command;
@@ -704,6 +766,8 @@ void StartUiTask(void *argument)
 
   /* 读取控制层的安全初值，确保主页面锁图标与实际输出状态一致。 */
   (void)UiTask_UpdateMainThrottleView(&main_view);
+  UiTask_ResetCalibrationSession(&center_calibration,
+                                 extreme_calibrations);
 
   /*
      * UiTask是调度器启动后唯一调用显示绘制函数的任务。开机首先绘制主页面；
@@ -718,6 +782,8 @@ void StartUiTask(void *argument)
       osKernelGetTickCount() + pdMS_TO_TICKS(MAIN_UI_REFRESH_PERIOD_MS);
   next_throttle_bar_refresh_tick = 0U;
   next_throttle_value_refresh_tick = 0U;
+  next_calibration_sample_tick = 0U;
+  next_calibration_display_tick = 0U;
 
   /* Infinite loop */
   for(;;)
@@ -820,6 +886,125 @@ void StartUiTask(void *argument)
         }
       }
     }
+    else if (current_page == UI_PAGE_JOYSTICK_CALIBRATION)
+    {
+      JoystickCalibrationExtremeSlot_t active_slot;
+      JoystickCalibrationAxis_t active_axis;
+      JoystickCalibrationExtremeDirection_t active_direction;
+      JoystickExtremeCalibration_t *active_extreme_calibration = NULL;
+      const bool center_sampling =
+          (calibration_view.step ==
+           JOYSTICK_CALIBRATION_UI_STEP_CENTER) &&
+          (center_calibration.state ==
+           JOYSTICK_CENTER_CALIBRATION_SAMPLING);
+
+      if (UiTask_GetExtremeStepConfig(calibration_view.step,
+                                      &active_slot,
+                                      &active_axis,
+                                      &active_direction))
+      {
+        active_extreme_calibration =
+            &extreme_calibrations[(uint8_t)active_slot];
+      }
+
+      const bool extreme_sampling =
+          (active_extreme_calibration != NULL) &&
+          (active_extreme_calibration->state ==
+           JOYSTICK_EXTREME_CALIBRATION_SAMPLING);
+      const bool sample_due =
+          (center_sampling || extreme_sampling) &&
+          ((int32_t)(now_tick - next_calibration_sample_tick) >= 0);
+      const bool display_due =
+          ((int32_t)(now_tick - next_calibration_display_tick) >= 0);
+
+      if (sample_due || display_due)
+      {
+        JoystickRawValues_t raw_values;
+        const bool raw_available = Joystick_GetLatestRaw(&raw_values);
+
+        if (sample_due)
+        {
+          bool sample_completed = false;
+
+          if (raw_available)
+          {
+            if (calibration_view.step ==
+                JOYSTICK_CALIBRATION_UI_STEP_CENTER)
+            {
+              sample_completed = JoystickCenterCalibration_Process(
+                  &center_calibration,
+                  g_joystick_snapshot_count,
+                  raw_values.direction_raw,
+                  raw_values.throttle_raw);
+            }
+            else if (active_extreme_calibration != NULL)
+            {
+              /*
+               * 通用极限采样器按当前步骤选择X/Y：raw_x来自DMA[0]，
+               * raw_y来自DMA[1]；极大/极小方向由步骤映射统一判断。
+               */
+              sample_completed = JoystickExtremeCalibration_Process(
+                  active_extreme_calibration,
+                  g_joystick_snapshot_count,
+                  raw_values.direction_raw,
+                  raw_values.throttle_raw);
+            }
+          }
+
+          if (sample_completed)
+          {
+            const JoystickCalibrationUiView_t previous_calibration_view =
+                calibration_view;
+
+            /* DMA[0]/Rank1为X方向，DMA[1]/Rank2为Y油门。 */
+            calibration_view.raw_x = raw_values.direction_raw;
+            calibration_view.raw_y = raw_values.throttle_raw;
+            if (calibration_view.step ==
+                JOYSTICK_CALIBRATION_UI_STEP_CENTER)
+            {
+              calibration_view.state =
+                  (center_calibration.state ==
+                   JOYSTICK_CENTER_CALIBRATION_SUCCEEDED)
+                      ? JOYSTICK_CALIBRATION_UI_SUCCEEDED
+                      : JOYSTICK_CALIBRATION_UI_FAILED;
+            }
+            else if (active_extreme_calibration != NULL)
+            {
+              calibration_view.state =
+                  (active_extreme_calibration->state ==
+                   JOYSTICK_EXTREME_CALIBRATION_SUCCEEDED)
+                      ? JOYSTICK_CALIBRATION_UI_SUCCEEDED
+                      : JOYSTICK_CALIBRATION_UI_FAILED;
+            }
+            JoystickCalibrationUI_Update(&previous_calibration_view,
+                                         &calibration_view);
+          }
+
+          UiTask_AdvancePeriodicDeadline(
+              &next_calibration_sample_tick,
+              pdMS_TO_TICKS(JOYSTICK_CALIBRATION_SAMPLE_PERIOD_MS),
+              now_tick);
+        }
+
+        if (display_due)
+        {
+          const JoystickCalibrationUiView_t previous_calibration_view =
+              calibration_view;
+
+          if (raw_available)
+          {
+            calibration_view.raw_x = raw_values.direction_raw;
+            calibration_view.raw_y = raw_values.throttle_raw;
+          }
+          JoystickCalibrationUI_Update(&previous_calibration_view,
+                                       &calibration_view);
+          UiTask_AdvancePeriodicDeadline(
+              &next_calibration_display_tick,
+              pdMS_TO_TICKS(JOYSTICK_CALIBRATION_DISPLAY_PERIOD_MS),
+              now_tick);
+        }
+      }
+    }
 
     now_tick = osKernelGetTickCount();
     if (current_page == UI_PAGE_MAIN)
@@ -836,9 +1021,48 @@ void StartUiTask(void *argument)
 
       queue_wait_ticks = (bar_wait < value_wait) ? bar_wait : value_wait;
     }
+    else if (current_page == UI_PAGE_JOYSTICK_CALIBRATION)
+    {
+      JoystickCalibrationExtremeSlot_t active_slot;
+      JoystickCalibrationAxis_t active_axis;
+      JoystickCalibrationExtremeDirection_t active_direction;
+      bool extreme_sampling = false;
+      const uint32_t display_wait = UiTask_TicksUntil(
+          now_tick, next_calibration_display_tick);
+
+      if (UiTask_GetExtremeStepConfig(calibration_view.step,
+                                      &active_slot,
+                                      &active_axis,
+                                      &active_direction))
+      {
+        extreme_sampling =
+            extreme_calibrations[(uint8_t)active_slot].state ==
+            JOYSTICK_EXTREME_CALIBRATION_SAMPLING;
+      }
+
+      const bool calibration_sampling =
+          ((calibration_view.step ==
+            JOYSTICK_CALIBRATION_UI_STEP_CENTER) &&
+           (center_calibration.state ==
+            JOYSTICK_CENTER_CALIBRATION_SAMPLING)) ||
+          extreme_sampling;
+
+      if (calibration_sampling)
+      {
+        const uint32_t sample_wait = UiTask_TicksUntil(
+            now_tick, next_calibration_sample_tick);
+        queue_wait_ticks = (sample_wait < display_wait)
+                               ? sample_wait
+                               : display_wait;
+      }
+      else
+      {
+        queue_wait_ticks = display_wait;
+      }
+    }
     else
     {
-      /* 方向页面没有连续显示项，可以永久等待下一条UI消息。 */
+      /* 方向/设置等页面没有连续显示项，可等待下一条UI消息。 */
       queue_wait_ticks = osWaitForever;
     }
 
@@ -1166,11 +1390,53 @@ void StartUiTask(void *argument)
           }
           else if ((input->action == UI_INPUT_ACTION_SHORT_PRESS) &&
                    (input->key_id == KEY_ID_CONFIRM) &&
+                   (settings_view.focus ==
+                    SETTINGS_UI_FOCUS_JOYSTICK_CALIBRATION))
+          {
+            JoystickRawValues_t raw_values;
+
+            /*
+             * 每次从设置页进入都创建一轮新的RAM临时会话。默认焦点在OK，
+             * 但不会自动开始采样，必须等待用户短按Confirm。
+             */
+            UiTask_ResetCalibrationSession(&center_calibration,
+                                           extreme_calibrations);
+            calibration_view.step =
+                JOYSTICK_CALIBRATION_UI_STEP_CENTER;
+            calibration_view.focus = JOYSTICK_CALIBRATION_UI_FOCUS_OK;
+            calibration_view.state = JOYSTICK_CALIBRATION_UI_READY;
+            if (Joystick_GetLatestRaw(&raw_values))
+            {
+              calibration_view.raw_x = raw_values.direction_raw;
+              calibration_view.raw_y = raw_values.throttle_raw;
+            }
+
+            current_page = UI_PAGE_JOYSTICK_CALIBRATION;
+            refresh_start_tick = osKernelGetTickCount();
+            JoystickCalibrationUI_Draw(&calibration_view);
+            refresh_duration =
+                osKernelGetTickCount() - refresh_start_tick;
+            g_ui_last_refresh_time_ms = refresh_duration;
+            if (refresh_duration > g_ui_max_refresh_time_ms)
+            {
+              g_ui_max_refresh_time_ms = refresh_duration;
+            }
+
+            now_tick = osKernelGetTickCount();
+            next_calibration_sample_tick =
+                now_tick +
+                pdMS_TO_TICKS(JOYSTICK_CALIBRATION_SAMPLE_PERIOD_MS);
+            next_calibration_display_tick =
+                now_tick +
+                pdMS_TO_TICKS(JOYSTICK_CALIBRATION_DISPLAY_PERIOD_MS);
+          }
+          else if ((input->action == UI_INPUT_ACTION_SHORT_PRESS) &&
+                   (input->key_id == KEY_ID_CONFIRM) &&
                    (settings_view.focus == SETTINGS_UI_FOCUS_BRIGHTNESS))
           {
             /*
-             * 只接入工程中已经存在的亮度业务。System、摇杆校准、
-             * Node ID和声音尚无完整业务，本次Confirm不虚构处理逻辑。
+             * 只接入工程中已经存在的亮度业务。System、Node ID和声音
+             * 尚无完整业务，本次Confirm不虚构处理逻辑。
              */
             brightness_return_page = UI_PAGE_SETTINGS;
             current_page = UI_PAGE_BRIGHTNESS;
@@ -1193,6 +1459,375 @@ void StartUiTask(void *argument)
             if (refresh_duration > g_ui_max_refresh_time_ms)
             {
               g_ui_max_refresh_time_ms = refresh_duration;
+            }
+          }
+        }
+        else if (current_page == UI_PAGE_JOYSTICK_CALIBRATION)
+        {
+          const JoystickCalibrationUiView_t previous_calibration_view =
+              calibration_view;
+          const bool back_requested =
+              (input->key_id == KEY_ID_BACK) &&
+              ((input->action == UI_INPUT_ACTION_SHORT_PRESS) ||
+               (input->action == UI_INPUT_ACTION_LONG_PRESS));
+          const bool esc_confirmed =
+              (input->key_id == KEY_ID_CONFIRM) &&
+              (input->action == UI_INPUT_ACTION_SHORT_PRESS) &&
+              (calibration_view.focus ==
+               JOYSTICK_CALIBRATION_UI_FOCUS_ESC);
+          const bool next_confirmed =
+              (input->key_id == KEY_ID_CONFIRM) &&
+              (input->action == UI_INPUT_ACTION_SHORT_PRESS) &&
+              (calibration_view.focus ==
+               JOYSTICK_CALIBRATION_UI_FOCUS_NEXT);
+
+          if (back_requested || esc_confirmed)
+          {
+            /*
+             * ESC/BACK均取消本次临时候选值并回设置页；settings_view没有
+             * 被重置，所以焦点仍停在“摇杆校准”。
+             */
+            UiTask_ResetCalibrationSession(&center_calibration,
+                                           extreme_calibrations);
+            current_page = UI_PAGE_SETTINGS;
+            refresh_start_tick = osKernelGetTickCount();
+            SettingsUI_Draw(&settings_view);
+            refresh_duration =
+                osKernelGetTickCount() - refresh_start_tick;
+            g_ui_last_refresh_time_ms = refresh_duration;
+            if (refresh_duration > g_ui_max_refresh_time_ms)
+            {
+              g_ui_max_refresh_time_ms = refresh_duration;
+            }
+          }
+          else if ((input->action == UI_INPUT_ACTION_SHORT_PRESS) &&
+                   ((input->key_id == KEY_ID_UP) ||
+                    (input->key_id == KEY_ID_DOWN)))
+          {
+            /*
+             * 三个按钮循环选择：
+             * DOWN：OK -> NEXT -> ESC -> OK；UP沿相反方向循环。
+             */
+            if (input->key_id == KEY_ID_DOWN)
+            {
+              if (calibration_view.focus ==
+                  JOYSTICK_CALIBRATION_UI_FOCUS_OK)
+              {
+                calibration_view.focus =
+                    JOYSTICK_CALIBRATION_UI_FOCUS_NEXT;
+              }
+              else if (calibration_view.focus ==
+                       JOYSTICK_CALIBRATION_UI_FOCUS_NEXT)
+              {
+                calibration_view.focus =
+                    JOYSTICK_CALIBRATION_UI_FOCUS_ESC;
+              }
+              else
+              {
+                calibration_view.focus =
+                    JOYSTICK_CALIBRATION_UI_FOCUS_OK;
+              }
+            }
+            else
+            {
+              if (calibration_view.focus ==
+                  JOYSTICK_CALIBRATION_UI_FOCUS_OK)
+              {
+                calibration_view.focus =
+                    JOYSTICK_CALIBRATION_UI_FOCUS_ESC;
+              }
+              else if (calibration_view.focus ==
+                       JOYSTICK_CALIBRATION_UI_FOCUS_ESC)
+              {
+                calibration_view.focus =
+                    JOYSTICK_CALIBRATION_UI_FOCUS_NEXT;
+              }
+              else
+              {
+                calibration_view.focus =
+                    JOYSTICK_CALIBRATION_UI_FOCUS_OK;
+              }
+            }
+
+            if (previous_calibration_view.focus !=
+                calibration_view.focus)
+            {
+              JoystickCalibrationUI_Update(&previous_calibration_view,
+                                           &calibration_view);
+            }
+          }
+          else if ((input->action == UI_INPUT_ACTION_SHORT_PRESS) &&
+                   (input->key_id == KEY_ID_CONFIRM) &&
+                   (calibration_view.focus ==
+                    JOYSTICK_CALIBRATION_UI_FOCUS_OK))
+          {
+            bool sampling_started = false;
+
+            /*
+             * 五个步骤都由用户按OK触发。正在采样时Start返回false，
+             * 因而忽略重复Confirm；失败或成功后可重新采集100组。
+             */
+            if (calibration_view.step ==
+                JOYSTICK_CALIBRATION_UI_STEP_CENTER)
+            {
+              sampling_started = JoystickCenterCalibration_Start(
+                  &center_calibration,
+                  g_joystick_snapshot_count);
+            }
+            else
+            {
+              JoystickCalibrationExtremeSlot_t slot;
+              JoystickCalibrationAxis_t axis;
+              JoystickCalibrationExtremeDirection_t direction;
+
+              if (UiTask_GetExtremeStepConfig(calibration_view.step,
+                                              &slot,
+                                              &axis,
+                                              &direction))
+              {
+                const uint16_t center_value =
+                    (axis == JOYSTICK_CALIBRATION_AXIS_X)
+                        ? center_calibration.candidate_x
+                        : center_calibration.candidate_y;
+
+                sampling_started = JoystickExtremeCalibration_Start(
+                    &extreme_calibrations[(uint8_t)slot],
+                    g_joystick_snapshot_count,
+                    axis,
+                    direction,
+                    center_value,
+                    center_calibration.candidate_valid);
+              }
+            }
+
+            if (sampling_started)
+            {
+              calibration_view.state =
+                  JOYSTICK_CALIBRATION_UI_SAMPLING;
+              next_calibration_sample_tick =
+                  osKernelGetTickCount() +
+                  pdMS_TO_TICKS(
+                      JOYSTICK_CALIBRATION_SAMPLE_PERIOD_MS);
+              JoystickCalibrationUI_Update(&previous_calibration_view,
+                                           &calibration_view);
+            }
+          }
+          else if (next_confirmed)
+          {
+            if (calibration_view.step ==
+                JOYSTICK_CALIBRATION_UI_STEP_CENTER)
+            {
+              if ((center_calibration.state ==
+                   JOYSTICK_CENTER_CALIBRATION_SUCCEEDED) &&
+                  center_calibration.candidate_valid)
+              {
+                /*
+                 * 第一步候选中心继续保留在RAM，作为四个方向有效行程
+                 * 判断基准；进入第二步后仍须由用户按OK才开始采样。
+                 */
+                JoystickExtremeCalibration_Init(
+                    &extreme_calibrations[JOYSTICK_CALIBRATION_SLOT_UP]);
+                calibration_view.step =
+                    JOYSTICK_CALIBRATION_UI_STEP_UP;
+                calibration_view.focus =
+                    JOYSTICK_CALIBRATION_UI_FOCUS_OK;
+                calibration_view.state =
+                    JOYSTICK_CALIBRATION_UI_READY;
+                JoystickCalibrationUI_Update(
+                    &previous_calibration_view,
+                    &calibration_view);
+              }
+              else
+              {
+                calibration_view.state =
+                    JOYSTICK_CALIBRATION_UI_INCOMPLETE;
+                JoystickCalibrationUI_Update(
+                    &previous_calibration_view,
+                    &calibration_view);
+              }
+            }
+            else
+            {
+              JoystickCalibrationExtremeSlot_t current_slot;
+              JoystickCalibrationAxis_t current_axis;
+              JoystickCalibrationExtremeDirection_t current_direction;
+
+              if (UiTask_GetExtremeStepConfig(calibration_view.step,
+                                              &current_slot,
+                                              &current_axis,
+                                              &current_direction) &&
+                  (extreme_calibrations[(uint8_t)current_slot].state ==
+                   JOYSTICK_EXTREME_CALIBRATION_SUCCEEDED) &&
+                  extreme_calibrations[(uint8_t)current_slot]
+                      .candidate_valid)
+              {
+                if (calibration_view.step <
+                    JOYSTICK_CALIBRATION_UI_STEP_RIGHT)
+                {
+                  const JoystickCalibrationUiStep_t next_step =
+                      (JoystickCalibrationUiStep_t)
+                          ((uint8_t)calibration_view.step + 1U);
+                  JoystickCalibrationExtremeSlot_t next_slot;
+                  JoystickCalibrationAxis_t next_axis;
+                  JoystickCalibrationExtremeDirection_t next_direction;
+
+                  if (UiTask_GetExtremeStepConfig(next_step,
+                                                  &next_slot,
+                                                  &next_axis,
+                                                  &next_direction))
+                  {
+                    /*
+                     * 只初始化即将进入的槽位，已完成步骤的候选极限值
+                     * 继续留在RAM；新页面默认聚焦OK且不会自动采样。
+                     */
+                    JoystickExtremeCalibration_Init(
+                        &extreme_calibrations[(uint8_t)next_slot]);
+                    calibration_view.step = next_step;
+                    calibration_view.focus =
+                        JOYSTICK_CALIBRATION_UI_FOCUS_OK;
+                    calibration_view.state =
+                        JOYSTICK_CALIBRATION_UI_READY;
+                    JoystickCalibrationUI_Update(
+                        &previous_calibration_view,
+                        &calibration_view);
+                  }
+                }
+                else if (UiTask_AreCalibrationCandidatesValid(
+                             &center_calibration,
+                             extreme_calibrations))
+                {
+                  /*
+                   * CAL:5/5成功后，NEXT才允许进入结果页。结果页直接读取
+                   * 五步RAM候选值；此处仍不写FRAM、不替换正式校准参数。
+                   */
+                  UiTask_PrepareCalibrationResultView(
+                      &calibration_result_view,
+                      &center_calibration,
+                      extreme_calibrations,
+                      &persistent_settings);
+                  current_page =
+                      UI_PAGE_JOYSTICK_CALIBRATION_RESULT;
+
+                  refresh_start_tick = osKernelGetTickCount();
+                  JoystickCalibrationResultUI_Draw(
+                      &calibration_result_view);
+                  refresh_duration =
+                      osKernelGetTickCount() - refresh_start_tick;
+                  g_ui_last_refresh_time_ms = refresh_duration;
+                  if (refresh_duration > g_ui_max_refresh_time_ms)
+                  {
+                    g_ui_max_refresh_time_ms = refresh_duration;
+                  }
+                }
+              }
+              /* 当前步骤未成功时不切页，也不会覆盖已有候选数据。 */
+            }
+          }
+        }
+        else if (current_page ==
+                 UI_PAGE_JOYSTICK_CALIBRATION_RESULT)
+        {
+          const JoystickCalibrationResultUiView_t
+              previous_calibration_result_view =
+                  calibration_result_view;
+          const bool back_requested =
+              (input->key_id == KEY_ID_BACK) &&
+              ((input->action == UI_INPUT_ACTION_SHORT_PRESS) ||
+               (input->action == UI_INPUT_ACTION_LONG_PRESS));
+          const bool cancel_confirmed =
+              (input->key_id == KEY_ID_CONFIRM) &&
+              (input->action == UI_INPUT_ACTION_SHORT_PRESS) &&
+              (calibration_result_view.focus ==
+               JOYSTICK_CALIBRATION_RESULT_FOCUS_CANCEL);
+
+          if (back_requested || cancel_confirmed)
+          {
+            /*
+             * 未保存时CANCEL/BACK只丢弃本轮临时值；已经保存后，正式
+             * AppSettings和运行时参数均已更新，所以这里只结束校准会话。
+             * settings_view保持不变，返回后焦点仍在“摇杆校准”。
+             */
+            UiTask_ResetCalibrationSession(&center_calibration,
+                                           extreme_calibrations);
+            current_page = UI_PAGE_SETTINGS;
+
+            refresh_start_tick = osKernelGetTickCount();
+            SettingsUI_Draw(&settings_view);
+            refresh_duration =
+                osKernelGetTickCount() - refresh_start_tick;
+            g_ui_last_refresh_time_ms = refresh_duration;
+            if (refresh_duration > g_ui_max_refresh_time_ms)
+            {
+              g_ui_max_refresh_time_ms = refresh_duration;
+            }
+          }
+          else if ((input->action == UI_INPUT_ACTION_SHORT_PRESS) &&
+                   ((input->key_id == KEY_ID_UP) ||
+                    (input->key_id == KEY_ID_DOWN)))
+          {
+            /* 两个按钮构成闭环，UP和DOWN都切换到另一个按钮。 */
+            calibration_result_view.focus =
+                (calibration_result_view.focus ==
+                 JOYSTICK_CALIBRATION_RESULT_FOCUS_SAVE)
+                    ? JOYSTICK_CALIBRATION_RESULT_FOCUS_CANCEL
+                    : JOYSTICK_CALIBRATION_RESULT_FOCUS_SAVE;
+            JoystickCalibrationResultUI_Update(
+                &previous_calibration_result_view,
+                &calibration_result_view);
+          }
+          else if ((input->action == UI_INPUT_ACTION_SHORT_PRESS) &&
+                   (input->key_id == KEY_ID_CONFIRM) &&
+                   (calibration_result_view.focus ==
+                    JOYSTICK_CALIBRATION_RESULT_FOCUS_SAVE) &&
+                   !calibration_result_view.saved &&
+                   UiTask_AreCalibrationCandidatesValid(
+                       &center_calibration,
+                       extreme_calibrations))
+          {
+            AppSettings_t candidate_settings = persistent_settings;
+
+            /*
+             * X轴对应direction，Y轴对应throttle。只替换六个校准点和
+             * 完整校准标志；死区、DMA映射及方向反转标志全部沿用旧值。
+             */
+            candidate_settings.joystick_calibration.direction.minimum =
+                calibration_result_view.x_axis.minimum;
+            candidate_settings.joystick_calibration.direction.center =
+                calibration_result_view.x_axis.center;
+            candidate_settings.joystick_calibration.direction.maximum =
+                calibration_result_view.x_axis.maximum;
+            candidate_settings.joystick_calibration.throttle.minimum =
+                calibration_result_view.y_axis.minimum;
+            candidate_settings.joystick_calibration.throttle.center =
+                calibration_result_view.y_axis.center;
+            candidate_settings.joystick_calibration.throttle.maximum =
+                calibration_result_view.y_axis.maximum;
+            candidate_settings.joystick_calibration.calibration_valid =
+                true;
+
+            /*
+             * SaveConfirmed会写非活动A/B槽、提交并回读CRC/字段。只有
+             * 整个事务成功后才更新运行RAM；失败则停留本页允许再次SAVE。
+             */
+            if (AppSettings_SaveConfirmed(&candidate_settings) == HAL_OK)
+            {
+              if (!Joystick_ApplyCalibrationSettings(
+                      &candidate_settings.joystick_calibration))
+              {
+                /*
+                 * AppSettings和Joystick使用相同合法性约束，正常情况下
+                 * 不可能到达；若程序约束以后失配，禁止继续错误运行。
+                 */
+                Error_Handler();
+              }
+              else
+              {
+                persistent_settings = candidate_settings;
+                calibration_result_view.saved = true;
+                JoystickCalibrationResultUI_Update(
+                    &previous_calibration_result_view,
+                    &calibration_result_view);
+              }
             }
           }
         }
@@ -1688,6 +2323,161 @@ void StartInputTask(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+/**
+ * @brief 把CAL:2~5映射为RAM槽位、ADC轴和相对中心的极值方向。
+ */
+static bool UiTask_GetExtremeStepConfig(
+    JoystickCalibrationUiStep_t step,
+    JoystickCalibrationExtremeSlot_t *slot,
+    JoystickCalibrationAxis_t *axis,
+    JoystickCalibrationExtremeDirection_t *direction)
+{
+  if ((slot == NULL) || (axis == NULL) || (direction == NULL))
+  {
+    return false;
+  }
+
+  switch (step)
+  {
+    case JOYSTICK_CALIBRATION_UI_STEP_UP:
+      *slot = JOYSTICK_CALIBRATION_SLOT_UP;
+      *axis = JOYSTICK_CALIBRATION_AXIS_Y;
+      *direction = JOYSTICK_CALIBRATION_EXTREME_MAXIMUM;
+      return true;
+
+    case JOYSTICK_CALIBRATION_UI_STEP_DOWN:
+      *slot = JOYSTICK_CALIBRATION_SLOT_DOWN;
+      *axis = JOYSTICK_CALIBRATION_AXIS_Y;
+      *direction = JOYSTICK_CALIBRATION_EXTREME_MINIMUM;
+      return true;
+
+    case JOYSTICK_CALIBRATION_UI_STEP_LEFT:
+      *slot = JOYSTICK_CALIBRATION_SLOT_LEFT;
+      *axis = JOYSTICK_CALIBRATION_AXIS_X;
+      *direction = JOYSTICK_CALIBRATION_EXTREME_MAXIMUM;
+      return true;
+
+    case JOYSTICK_CALIBRATION_UI_STEP_RIGHT:
+      *slot = JOYSTICK_CALIBRATION_SLOT_RIGHT;
+      *axis = JOYSTICK_CALIBRATION_AXIS_X;
+      *direction = JOYSTICK_CALIBRATION_EXTREME_MINIMUM;
+      return true;
+
+    case JOYSTICK_CALIBRATION_UI_STEP_CENTER:
+    default:
+      return false;
+  }
+}
+
+/**
+ * @brief 最终确认前再次校验五个步骤及双轴MIN<CEN<MAX关系。
+ *
+ * 单步采样器已经做过稳定性、ADC范围和最小有效行程检查；这里仍进行一次
+ * 会话级交叉校验，防止页面状态或RAM内容异常时把不完整结果写入FRAM。
+ */
+static bool UiTask_AreCalibrationCandidatesValid(
+    const JoystickCenterCalibration_t *center,
+    const JoystickExtremeCalibration_t
+        extremes[JOYSTICK_CALIBRATION_SLOT_COUNT])
+{
+  uint16_t x_minimum;
+  uint16_t x_maximum;
+  uint16_t y_minimum;
+  uint16_t y_maximum;
+
+  if ((center == NULL) || (extremes == NULL) ||
+      (center->state != JOYSTICK_CENTER_CALIBRATION_SUCCEEDED) ||
+      !center->candidate_valid)
+  {
+    return false;
+  }
+
+  for (uint8_t slot_index = 0U;
+       slot_index < (uint8_t)JOYSTICK_CALIBRATION_SLOT_COUNT;
+       ++slot_index)
+  {
+    if ((extremes[slot_index].state !=
+         JOYSTICK_EXTREME_CALIBRATION_SUCCEEDED) ||
+        !extremes[slot_index].candidate_valid)
+    {
+      return false;
+    }
+  }
+
+  /* 物理右/下是ADC较小端，物理左/上是ADC较大端。 */
+  x_minimum =
+      extremes[JOYSTICK_CALIBRATION_SLOT_RIGHT].candidate_value;
+  x_maximum =
+      extremes[JOYSTICK_CALIBRATION_SLOT_LEFT].candidate_value;
+  y_minimum =
+      extremes[JOYSTICK_CALIBRATION_SLOT_DOWN].candidate_value;
+  y_maximum =
+      extremes[JOYSTICK_CALIBRATION_SLOT_UP].candidate_value;
+
+  return (x_minimum < center->candidate_x) &&
+         (center->candidate_x < x_maximum) &&
+         (y_minimum < center->candidate_y) &&
+         (center->candidate_y < y_maximum) &&
+         (x_maximum <= JOYSTICK_CENTER_ADC_MAXIMUM) &&
+         (y_maximum <= JOYSTICK_CENTER_ADC_MAXIMUM);
+}
+
+/**
+ * @brief 将本次五步RAM候选值和当前死区组织成结果页显示模型。
+ */
+static void UiTask_PrepareCalibrationResultView(
+    JoystickCalibrationResultUiView_t *view,
+    const JoystickCenterCalibration_t *center,
+    const JoystickExtremeCalibration_t
+        extremes[JOYSTICK_CALIBRATION_SLOT_COUNT],
+    const AppSettings_t *settings)
+{
+  if ((view == NULL) || (center == NULL) || (extremes == NULL) ||
+      (settings == NULL))
+  {
+    return;
+  }
+
+  view->x_axis.minimum =
+      extremes[JOYSTICK_CALIBRATION_SLOT_RIGHT].candidate_value;
+  view->x_axis.center = center->candidate_x;
+  view->x_axis.maximum =
+      extremes[JOYSTICK_CALIBRATION_SLOT_LEFT].candidate_value;
+  view->x_axis.dead_zone =
+      settings->joystick_calibration.direction.dead_zone;
+
+  view->y_axis.minimum =
+      extremes[JOYSTICK_CALIBRATION_SLOT_DOWN].candidate_value;
+  view->y_axis.center = center->candidate_y;
+  view->y_axis.maximum =
+      extremes[JOYSTICK_CALIBRATION_SLOT_UP].candidate_value;
+  view->y_axis.dead_zone =
+      settings->joystick_calibration.throttle.dead_zone;
+
+  view->focus = JOYSTICK_CALIBRATION_RESULT_FOCUS_SAVE;
+  view->saved = false;
+}
+
+/** @brief 清除本轮五步RAM候选值，不影响正式运行参数或FRAM。 */
+static void UiTask_ResetCalibrationSession(
+    JoystickCenterCalibration_t *center,
+    JoystickExtremeCalibration_t
+        extremes[JOYSTICK_CALIBRATION_SLOT_COUNT])
+{
+  if ((center == NULL) || (extremes == NULL))
+  {
+    return;
+  }
+
+  JoystickCenterCalibration_Init(center);
+  for (uint8_t slot_index = 0U;
+       slot_index < (uint8_t)JOYSTICK_CALIBRATION_SLOT_COUNT;
+       ++slot_index)
+  {
+    JoystickExtremeCalibration_Init(&extremes[slot_index]);
+  }
+}
 
 /**
  * @brief 计算距离绝对截止时间还剩多少RTOS Tick。
